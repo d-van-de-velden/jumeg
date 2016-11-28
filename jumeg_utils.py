@@ -1,12 +1,21 @@
 '''
 Utilities module for jumeg
 '''
-import mne
+
+# Authors: Jurgen Dammers (j.dammers@fz-juelich.de)
+#          Praveen Sripad (pravsripad@gmail.com)
+#
+# License: BSD (3-clause)
+
+import sys
 import os
+import os.path as op
 import numpy as np
 import scipy as sci
+import mne
 from mne.utils import logger
-
+import matplotlib.cm as cmx
+import matplotlib.colors as colors
 
 def get_files_from_list(fin):
     ''' Return string of file or files as iterables lists '''
@@ -18,6 +27,16 @@ def get_files_from_list(fin):
         else:
             fout = list(fin)
     return fout
+
+
+def retcode_error(command, subj):
+    print '%s did not run successfully for subject %s.' % (command, subj)
+    print 'Please check the arguments, and rerun for subject.'
+
+
+def get_jumeg_path():
+    '''Return the path where jumeg is installed.'''
+    return os.path.abspath(os.path.dirname(__file__))
 
 
 def check_jumeg_standards(fnames):
@@ -78,13 +97,20 @@ def get_sytem_type(info):
     ctf_other_types = (FIFF.FIFFV_COIL_CTF_REF_MAG,
                        FIFF.FIFFV_COIL_CTF_REF_GRAD,
                        FIFF.FIFFV_COIL_CTF_OFFDIAG_REF_GRAD)
+    elekta_types = (FIFF.FIFFV_COIL_VV_MAG_T3,
+                    FIFF.FIFFV_COIL_VV_PLANAR_T1)
     has_CTF_grad = (FIFF.FIFFV_COIL_CTF_GRAD in coil_types or
                     (FIFF.FIFFV_MEG_CH in channel_types and
                      any([k in ctf_other_types for k in coil_types])))
+    has_Elekta_grad = (FIFF.FIFFV_COIL_VV_MAG_T3 in coil_types or
+                      (FIFF.FIFFV_MEG_CH in channel_types and
+                       any([k in elekta_types for k in coil_types])))
     if has_4D_mag:
         system_type = 'magnesWH3600'
     elif has_CTF_grad:
         system_type = 'CTF-275'
+    elif has_Elekta_grad:
+        system_type = 'ElektaNeuromagTriux'
     else:
         # ToDo: Expand method to also cope with other systems!
         print "System type not known!"
@@ -110,18 +136,20 @@ def mark_bads_batch(subject_list, subjects_dir=None):
     added to the file name.
     '''
     for subj in subject_list:
-        print "For subject %s"%(subj)
-        if not subjects_dir: SUBJECTS_DIR = os.environ['SUBJECTS_DIR']
-        dirname = SUBJECTS_DIR+'/'+subj
-        for raw_fname in os.listdir(dirname):
+        print "For subject %s" % (subj)
+        if not subjects_dir: subjects_dir = os.environ['SUBJECTS_DIR']
+        dirname = subjects_dir + '/' + subj
+        sub_file_list = os.listdir(dirname)
+        for raw_fname in sub_file_list:
+            if raw_fname.endswith('_bcc-raw.fif'): continue
             if raw_fname.endswith('-raw.fif'):
-                print "Raw calculations for file %s"%(dirname+'/'+raw_fname)
-                raw = mne.io.Raw(dirname+'/'+raw_fname)
+                print "Raw calculations for file %s" % (dirname + '/' + raw_fname)
+                raw = mne.io.Raw(dirname + '/' + raw_fname, preload=True)
                 raw.plot(block=True)
-                print 'The bad channels marked are'+raw.info['bads']
-                raw.save(raw.info['filename'].split('/')[-1].split('.')[0]+ \
-                         '_bcc-raw.fif')
-                return
+                print 'The bad channels marked are %s ' % (raw.info['bads'])
+                save_fname = dirname + '/' + raw.info['filename'].split('/')[-1].split('-raw.fif')[0] + '_bcc-raw.fif'
+                raw.save(save_fname)
+    return
 
 
 def rescale_artifact_to_signal(signal, artifact):
@@ -146,23 +174,27 @@ def update_description(raw, comment):
     raw.info['description'] = str(raw.info['description']) + ' ; ' + comment
 
 
-def chop_raw_data(raw, start_time=60.0, stop_time=360.0):
+def chop_raw_data(raw, start_time=60.0, stop_time=360.0, save=True):
     '''
     This function extracts specified duration of raw data
-    and write it into a fif file.
+    and writes it into a fif file.
     Five mins of data will be extracted by default.
 
     Parameters
     ----------
 
-    raw: Raw object.
+    raw: Raw object or raw file name as a string.
     start_time: Time to extract data from in seconds. Default is 60.0 seconds.
     stop_time: Time up to which data is to be extracted. Default is 360.0 seconds.
+    save: bool, If True the raw file is written to disk.
 
     '''
+    if isinstance(raw, str):
+        print 'Raw file name provided, loading raw object...'
+        raw = mne.io.Raw(raw, preload=True)
     # Check if data is longer than required chop duration.
-    if (raw.n_times / (raw.info['sfreq'])) < (stop_time + 60.0):
-        logger.info("The data is not long enough.")
+    if (raw.n_times / (raw.info['sfreq'])) < (stop_time + start_time):
+        logger.info("The data is not long enough for file %s.") % (raw.info['filename'])
         return
     # Obtain indexes for start and stop times.
     assert start_time < stop_time, "Start time is greater than stop time."
@@ -171,9 +203,10 @@ def chop_raw_data(raw, start_time=60.0, stop_time=360.0):
     data, times = raw[:, start_idx:stop_idx]
     raw._data,raw._times = data, times
     dur = int((stop_time - start_time) / 60)
-    raw.save(raw.info['filename'].split('/')[-1].split('.')[0] + '_' + str(dur) + 'm.fif')
-    # For the moment, simply warn.
-    logger.warning('The file name is not saved in standard form.')
+    if save:
+        #raw.save(raw.info['filename'].split('/')[-1].split('.')[0] + '_' + str(dur) + 'm-raw.fif')
+        raw.save(raw.info['filename'].split('-raw.fif')[0] + ',' + str(dur) + 'm-raw.fif')
+    raw.close()
     return
 
 
@@ -348,11 +381,162 @@ def make_phase_shuffled_surrogates_epochs(epochs, check_power=False):
 
     return surrogate
 
-    
+
+
+#######################################################
+#                                                     #
+#      to extract the indices of the R-peak from      #
+#               ECG single channel data               #
+#                                                     #
+#######################################################
+def get_peak_ecg(ecg, sfreq=1017.25, flow=10, fhigh=20,
+                 pct_thresh=95.0, default_peak2peak_min=0.5,
+                 event_id=999):
+
+    # -------------------------------------------
+    # import necessary modules
+    # -------------------------------------------
+    from mne.filter import band_pass_filter
+    from jumeg.jumeg_math import calc_tkeo
+    from scipy.signal import argrelextrema as extrema
+
+    # -------------------------------------------
+    # filter ECG to get rid of noise and drifts
+    # -------------------------------------------
+    fecg = band_pass_filter(ecg, sfreq, flow, fhigh,
+                            n_jobs=1, method='fft')
+    ecg_abs = np.abs(fecg)
+
+    # -------------------------------------------
+    # apply Teager Kaiser energie Operator (TKEO)
+    # -------------------------------------------
+    tk_ecg = calc_tkeo(fecg)
+
+    # -------------------------------------------
+    # find all peaks of abs(EOG)
+    # since we don't know if the EOG lead has a
+    # positive or negative R-peak
+    # -------------------------------------------
+    ixpeak = extrema(tk_ecg, np.greater, axis=0)
+
+
+    # -------------------------------------------
+    # threshold for |R-peak|
+    # ------------------------------------------
+    peak_thresh_min = np.percentile(tk_ecg, pct_thresh, axis=0)
+    ix = np.where(tk_ecg[ixpeak] > peak_thresh_min)[0]
+    npeak = len(ix)
+    if (npeak > 1):
+        ixpeak = ixpeak[0][ix]
+    else:
+        return -1
+
+
+    # -------------------------------------------
+    # threshold for max Amplitude of R-peak
+    # fixed to: median + 3*stddev
+    # -------------------------------------------
+    mag = fecg[ixpeak]
+    mag_mean = np.median(mag)
+    if (mag_mean > 0):
+        nstd = 3
+    else:
+        nstd = -3
+
+    peak_thresh_max = mag_mean + nstd * np.std(mag)
+    ix = np.where(ecg_abs[ixpeak] < np.abs(peak_thresh_max))[0]
+    npeak = len(ix)
+
+    if (npeak > 1):
+        ixpeak = ixpeak[ix]
+    else:
+        return -1
+
+
+    # -------------------------------------------
+    # => test if the R-peak is positive or negative
+    # => we assume the the R-peak is the largest peak !!
+    #
+    # ==> sometime we have outliers and we should check
+    #     the number of npos and nneg peaks -> which is larger?  -> note done yet
+    #     -> we assume at least 2 peaks -> maybe we should check the ratio
+    # -------------------------------------------
+    ixp = np.where(fecg[ixpeak] > 0)[0]
+    npos = len(ixp)
+    ixn = np.where(fecg[ixpeak] < 0)[0]
+    nneg = len(ixp)
+
+    if (npos == 0 and nneg == 0):
+        import pdb
+        pdb.set_trace()
+    if (npos > 3):
+        peakval_pos = np.abs(np.median(ecg[ixpeak[ixp]]))
+    else:
+        peakval_pos = 0
+
+    if (nneg > 3): peakval_neg = np.abs(np.median(ecg[ixpeak[ixn]]))
+    else:
+        peakval_neg = 0
+
+    if (peakval_pos > peakval_neg):
+        ixpeak  = ixpeak[ixp]
+        ecg_pos = ecg
+    else:
+        ixpeak  = ixpeak[ixn]
+        ecg_pos = - ecg
+
+    npeak = len(ixpeak)
+    if (npeak < 1):
+        return -1
+
+
+    # -------------------------------------------
+    # check if we have peaks too close together
+    # -------------------------------------------
+    peak_ecg = ixpeak/sfreq
+    dur = (np.roll(peak_ecg, -1)-peak_ecg)
+    ix  = np.where(dur > default_peak2peak_min)[0]
+    npeak = len(ix)
+    if (npeak < 1):
+        return -1
+
+    ixpeak = np.append(ixpeak[0], ixpeak[ix])
+    peak_ecg = ixpeak/sfreq
+    dur = (peak_ecg-np.roll(peak_ecg, 1))
+    ix  = np.where(dur > default_peak2peak_min)[0]
+    npeak = len(ix)
+    if (npeak < 1):
+        return -1
+
+    ixpeak = np.unique(np.append(ixpeak, ixpeak[ix[npeak-1]]))
+    npeak = len(ixpeak)
+
+    # -------------------------------------------
+    # search around each peak if we find
+    # higher peaks in a range of 0.1 s
+    # -------------------------------------------
+    seg_length = np.ceil(0.1 * sfreq)
+    for ipeak in range(0, npeak-1):
+        idx = [int(np.max([ixpeak[ipeak] - seg_length, 0])),
+               int(np.min([ixpeak[ipeak]+seg_length, len(ecg)]))]
+        idx_want = np.argmax(ecg_pos[idx[0]:idx[1]])
+        ixpeak[ipeak] = idx[0] + idx_want
+
+
+    # -------------------------------------------
+    # to be confirm with mne implementation
+    # -------------------------------------------
+    ecg_events = np.c_[ixpeak, np.zeros(npeak),
+                       np.zeros(npeak)+event_id]
+
+    return ecg_events.astype(int)
+
+
+
 # def make_surrogates_epoch_numpy(epochs):
 #     '''
 #     Make surrogate epochs by simply shuffling. Destroy time-phase relationship for each trial.
-    
+
 #     Parameters
 #     ----------
 #     Epochs Object.
@@ -405,7 +589,7 @@ def make_surrogates_ctps(phase_array, nrepeat=1000, mode='shuffle', n_jobs=4,
     from joblib import Parallel, delayed
     from mne.parallel import parallel_func
     from mne.preprocessing.ctps_ import kuiper
-    
+
     nfreq, ntrials, nsources, nsamples = phase_array.shape
     pk = np.zeros((nfreq, nrepeat, nsources, nsamples), dtype='float32')
 
@@ -428,7 +612,7 @@ def make_surrogates_ctps(phase_array, nrepeat=1000, mode='shuffle', n_jobs=4,
 
             # calculate Kuiper's statistics for each phase array
             out = parallel(my_kuiper(i) for i in pt_s)
-            
+
             # store stat and pk in different arrays
             out = np.array(out, dtype='float32')
             # ks[ifreq,:,isource,:] = out[:,0,:]  # is actually not needed
@@ -470,7 +654,7 @@ def get_stats_surrogates_ctps(pksarr, verbose=False):
     pks_min = pks.min(axis=1)
     pks_mean = pks.mean(axis=1)
     pks_std = pks.std(axis=1)
-   
+
     # global stats
     pks_max_global = pks.max()
     pks_min_global = pks.min()
@@ -478,6 +662,8 @@ def get_stats_surrogates_ctps(pksarr, verbose=False):
     pks_std_global = pks.std()
 
     pks_pct99_global = np.percentile(pksarr, 99)
+    pks_pct999_global = np.percentile(pksarr, 99.9)
+    pks_pct9999_global = np.percentile(pksarr, 99.99)
 
     # collect info and store into dictionary
     stats = {
@@ -495,7 +681,9 @@ def get_stats_surrogates_ctps(pksarr, verbose=False):
             'pks_max_global': pks_max_global,
             'pks_mean_global': pks_mean_global,
             'pks_std_global': pks_std_global,
-            'pks_pct99_global': pks_pct99_global
+            'pks_pct99_global': pks_pct99_global,
+            'pks_pct999_global': pks_pct999_global,
+            'pks_pct9999_global': pks_pct9999_global
             }
 
     # mean and std dev
@@ -508,6 +696,8 @@ def get_stats_surrogates_ctps(pksarr, verbose=False):
         print 'overall stats:'
         print 'max/mean/std: ', pks_global_max, pks_global_mean, pks_global_std
         print '99th percentile: ', pks_global_pct99
+        print '99.90th percentile: ', pks_global_pct999
+        print '99.99th percentile: ', pks_global_pct9999
 
     return stats
 
@@ -791,7 +981,8 @@ def randomize_phase(data, random_state=None):
     return np.fft.irfft(data_freq, data.shape[0], axis=0)
 
 
-def create_dummy_raw(data, ch_types, sfreq, ch_names, save=False, raw_fname='output.fif'):
+def create_dummy_raw(data, ch_types, sfreq, ch_names, save=False,
+                     raw_fname='output.fif'):
     '''
     A function that can be used to quickly create a raw object with the
     data provided.
@@ -833,7 +1024,8 @@ def create_dummy_raw(data, ch_types, sfreq, ch_names, save=False, raw_fname='out
     return raw
 
 
-def create_dummy_epochs(data, events, ch_types, sfreq, ch_names, save=False, epochs_fname='output-epo.fif'):
+def create_dummy_epochs(data, events, ch_types, sfreq, ch_names, save=False,
+                        epochs_fname='output-epo.fif'):
     '''
     A function that can be used to quickly create an Epochs object with the
     data provided.
@@ -877,3 +1069,225 @@ def create_dummy_epochs(data, events, ch_types, sfreq, ch_names, save=False, epo
     if save:
         epochs.save(epochs_fname)
     return epochs
+
+
+def put_pngs_into_html(regexp, html_out='output.html'):
+    '''Lists all files in directory that matches pattern regexp
+       and puts it into an html file with filename included.
+
+    regexp : str
+        String of dir path like '/home/kalka/*.png'
+    html_out : str
+        Output file name
+    '''
+    import glob
+    files =  glob.glob(regexp)
+    html_string = ''
+    for fname in files:
+        my_string = '<body><p>%s</p></body>' % (fname) + '\n' + '<img src=%s>' % (fname) + '\n'
+        html_string += my_string
+    f = open(html_out, 'w')
+    message = """<html>
+          <head></head>
+          %s
+          </html>""" % (html_string)
+    f.write(message)
+    f.close()
+
+
+def crop_images(regexp, crop_dims=(150, 150, 1450, 700), extension='crop'):
+    '''Lists all files in directory that matches pattern regexp
+       and puts it into an html file with filename included.
+
+    regexp : str
+        String of dir path like '/home/kalka/*.png'
+    crop_dims : box tuple
+        Dimensions to crop image (using PIL)
+        (left, upper, right, lower) pixel values
+    extension : str
+        Output file name will be appended with extension.
+    '''
+    import glob
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError('For this method to work the PIL library is'
+                           ' required.')
+    files = glob.glob(regexp)
+    for fname in files:
+        orig = Image.open(fname)
+        out_fname = op.splitext(fname)[0] + ',' + extension +\
+                    op.splitext(fname)[1]
+        cropim = orig.crop((150, 150, 1450, 700))
+        print 'Saving cropped image at %s' % out_fname
+        cropim.save(out_fname, fname.split('.')[1])
+
+
+def check_env_variables(env_variable=None, key=None):
+    '''Check the most important environment variables as
+       (keys) - SUBJECTS_DIR, MNE_ROOT and FREESURFER_HOME.
+
+    e.g. subjects_dir = check_env_variable(subjects_dir, key='SUBJECTS_DIR')
+    If subjects_dir provided exists, then it is prioritized over the env variable.
+    If not, then the environment variable pertaining to the key is returned. If both
+    do not exist, then exits with an error message.
+    Also checks if the directory exists.
+    '''
+
+    if key is None or not isinstance(key, str):
+        print ('Please provide the key. Currently '
+              'SUBJECTS_DIR, MNE_ROOT and FREESURFER_HOME as strings are allowed.')
+        sys.exit()
+
+    # Check subjects_dir
+    if env_variable:
+        os.environ[key] = env_variable
+    elif env_variable is None and key in os.environ:
+        env_variable = os.environ[key]
+    else:
+        print 'Please set the %s' % (key)
+        sys.exit()
+
+    if not os.path.isdir(env_variable):
+        print 'Path %s is not a valid directory. Please check.' % (env_variable)
+        sys.exit()
+
+    return env_variable
+
+
+def convert_annot2labels(annot_fname, subject='fsaverage', subjects_dir=None,
+                         freesurfer_home=None):
+    '''
+    Convert an annotation to labels for a single subject for both hemispheres.
+    The labels are written to '$SUBJECTS_DIR/$SUBJECT/label'.
+
+    Parameters
+    ----------
+    annot_fname: str
+        The name of the annotation (or parcellation).
+    subject: str
+        Subject name. Default is the fresurfer fsaverage.
+    subjects_dir: str
+        The subjects directory, if not provided, then the
+        environment value is used.
+    freesurfer_home: str
+        The freeesurfer home path, if not provided, the
+        environment value is used.
+
+    Reference
+    ---------
+    https://surfer.nmr.mgh.harvard.edu/fswiki/mri_annotation2label
+    '''
+    from subprocess import call
+    subjects_dir = check_env_variables(subjects_dir, key='SUBJECTS_DIR')
+    freesurfer_home = check_env_variables(freesurfer_home, key='FREESURFER_HOME')
+    freesurfer_bin = os.path.join(freesurfer_home, 'bin', '')
+    outdir = os.path.join(subjects_dir, subject, 'label')
+    print 'Convert annotation %s to labels' % (annot_fname)
+    for hemi in ['lh', 'rh']:
+        retcode = call([freesurfer_bin + '/mri_annotation2label', '--subject', subject, '--hemi', hemi,
+                        '--annotation', annot_fname, '--outdir', outdir])
+        if retcode != 0:
+            retcode_error('mri_annotation2label')
+            continue
+
+
+def convert_label2label(annot_fname, subjects_list, srcsubject='fsaverage',
+                        subjects_dir=None, freesurfer_home=None):
+    '''
+    Python wrapper for Freesurfer mri_label2label function.
+    Converts all labels in annot_fname from source subject to target subject
+    given the subjects directory. Both hemispheres are considered.
+    The registration method used it surface.
+
+    Parameters
+    ----------
+    annot_fname: str
+        The name of the annotation (or parcellation).
+    subjects_list: list or str
+        Subject names to which the labels have to be transformed to (the target subjects).
+        Can be provided as a list or a string.
+    srcsubject: str
+        The name of the source subject to be used. The source subject should
+        contain the labels in the correct folders already. Default - fsaverage.
+    subjects_dir: str
+        The subjects directory, if not provided, then the
+        environment value is used.
+    freesurfer_home: str
+        The freeesurfer home path, if not provided, the
+        environment value is used.
+
+    Reference:
+    https://surfer.nmr.mgh.harvard.edu/fswiki/mri_label2label
+    '''
+    if subjects_list:
+        subjects_list = get_files_from_list(subjects_list)
+    else:
+        raise RuntimeError('No subjects are specified.')
+
+    subjects_dir = check_env_variables(subjects_dir, key='SUBJECTS_DIR')
+    freesurfer_home = check_env_variables(freesurfer_home, key='FREESURFER_HOME')
+    freesurfer_bin = os.path.join(freesurfer_home, 'bin', '')
+
+    # obtain the names of labels in parcellation
+    from mne.label import read_labels_from_annot
+    labels = read_labels_from_annot(srcsubject, parc=annot_fname)
+    lnames = [l.name.rsplit('-')[0] if l.hemi is 'lh' else '' for l in labels]
+    lnames = filter(None, lnames)  # remove empty strings
+
+    # convert the labels from source subject to target subject
+    from subprocess import call
+    for subj in subjects_list:
+        # the target subject is subj provided
+        print 'Converting labels from %s to %s' % (srcsubject, subj)
+        for label in lnames:
+            for hemi in ['lh', 'rh']:
+                srclabel = os.path.join(subjects_dir, srcsubject, 'label', hemi + '.' + label + '.label')
+                trglabel = os.path.join(subjects_dir, subj, 'label', hemi + '.' + label + '.label')
+                retcode = call([freesurfer_bin + 'mri_label2label', '--srclabel', srclabel, '--srcsubject', srcsubject,
+                    '--trglabel', trglabel, '--trgsubject', subj, '--regmethod', 'surface', '--hemi', hemi])
+                if retcode != 0:
+                    retcode_error('mri_label2label')
+                    continue
+
+    print 'Labels for %d subjects have been transformed from source %s' %(len(subjects_list), srcsubject)
+
+
+def get_cmap(N):
+    '''Returns a function that maps each index in 0, 1, ... N-1 to a distinct
+    RGB color.'''
+    color_norm = colors.Normalize(vmin=0, vmax=N-1)
+    scalar_map = cmx.ScalarMappable(norm=color_norm, cmap='hsv')
+
+    def map_index_to_rgb_color(index):
+        return scalar_map.to_rgba(index)
+    return map_index_to_rgb_color
+
+
+def subtract_overlapping_vertices(label, labels):
+    '''
+    Check if label overlaps with others in labels
+    and return a new label without the overlapping vertices.
+    The output label contains the original label vertices minus
+    vertices from all overlapping labels in the list.
+
+    label : instance of mne.Label
+    labels : list of labels
+    '''
+    for lab in labels:
+        if (lab.hemi == label.hemi and
+           np.intersect1d(lab.vertices, label.vertices).size > 0 and
+           lab is not label):
+            label = label - lab
+
+    if label.vertices.size > 0:
+        return label
+    else:
+        print 'Label has no vertices left '
+        return None
+
+
+def apply_percentile_threshold(in_data, percentile):
+    ''' Return ndarray with all values below percentile set to 0. '''
+    in_data[in_data <= np.percentile(in_data, percentile)] = 0.
+    return in_data

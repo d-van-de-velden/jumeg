@@ -5,8 +5,8 @@ import numpy as np
 import matplotlib.pyplot as pl
 import mne
 from mne.preprocessing import ctps_ as ctps
-from jumeg.jumeg_utils import get_files_from_list
-from jumeg.jumeg_plot import (plot_average, plot_performance_artifact_rejection,
+from jumeg_utils import get_files_from_list
+from jumeg_plot import (plot_average, plot_performance_artifact_rejection,
                               plot_compare_brain_responses)
 
 
@@ -23,8 +23,8 @@ ext_ave = '-ave.fif'
 ext_ica = '-ica.fif'
 ext_clean = ',ar-raw.fif'
 ext_icap = ',ica-performance'     # figure extension provided by the routine
-ext_empty_raw = '-empty.fif'
-ext_empty_cov = ',empty-cov.fif'
+ext_empty_raw = '-raw.fif'
+ext_empty_cov = '-cov.fif'
 prefix_filt = ',fibp'             # for now bp only
 prefix_ctps = ',ctpsbr-'        # e.g.: "...,ica,ctps-trigger.npy"
 
@@ -246,7 +246,12 @@ def apply_ica_cleaning(fname_ica, n_pca_components=None,
         # to unfiltered data
         if unfiltered:
             # adjust filenames to unfiltered data
-            basename = basename[:basename.rfind(',')]
+            # FIXME breaks when noise reduced file is used with basename + ',nr'
+            # temporarily fixed by checking for fibp filter suffix
+            if basename.find(',fibp') != -1:
+                basename = basename[:basename.rfind(',')]
+            else:
+                basename = basename
             fnfilt = basename + ext_raw
             fnclean = basename + ext_clean
             fnica_ar = basename + ext_icap
@@ -282,7 +287,7 @@ def apply_ica_cleaning(fname_ica, n_pca_components=None,
 
         # apply cleaning
         meg_clean = ica.apply(meg_raw, exclude=ica.exclude,
-                              n_pca_components=npca, copy=True)
+                              n_pca_components=npca)
         meg_clean.save(fnclean, overwrite=True)
 
         # plot ECG, EOG averages before and after ICA
@@ -690,6 +695,8 @@ def apply_ctps_surrogates(fname_ctps, fnout, nrepeat=1000,
         info.append('pk mean: '+ str('%8.3f' % stats['pks_mean_global']))
         info.append('pk std:  '+ str('%8.3f' % stats['pks_std_global']))
         info.append('pk pct99:'+ str('%8.3f' % stats['pks_pct99_global']))
+        info.append('pk pct99.90:'+ str('%8.3f' % stats['pks_pct999_global']))
+        info.append('pk pct99.99:'+ str('%8.3f' % stats['pks_pct9999_global']))
         info.append('pk max:  '+ str('%8.3f' % stats['pks_max_global']))
 
 
@@ -709,6 +716,8 @@ def apply_ctps_surrogates(fname_ctps, fnout, nrepeat=1000,
         info.append('pk mean: '+ str('%8.3f' % pks_all.mean()))
         info.append('pk std:  '+ str('%8.3f' % pks_all.std()))
         info.append('pk pct99:'+ str('%8.3f' % np.percentile(pks_all,99)))
+        info.append('pk pct99.90:'+ str('%8.3f' % np.percentile(pks_all,99.9)))
+        info.append('pk pct99.99:'+ str('%8.3f' % np.percentile(pks_all,99.99)))
         info.append('pk max:  '+ str('%8.3f' % pks_all.max()))
 
     info.append('#')
@@ -776,12 +785,15 @@ def apply_ctps_select_ic(fname_ctps, threshold=0.1):
             ax = fig.add_subplot(nrow, 2, ifreq + 1)
             pl.bar(x, pkmax, color='steelblue')
             pl.bar(x[ix], pkmax[ix], color='red')
+            pl.plot(x,np.repeat(threshold,ncomp),color='black')
             pl.title(trig_name + frange, fontsize='small')
             pl.xlim([1, ncomp + 1])
             pl.ylim([0, 0.5])
             pl.text(2, 0.45, 'ICs: ' + str(ix + 1))
         ic_sel = np.unique(ic_sel)
         nic = np.size(ic_sel)
+        fig.text(0.02, 0.98, 'pK threshold: ' + str(threshold),
+                 transform=ax.transAxes)
         info = 'ICs (all): ' + str(ic_sel).strip('[]')
         fig.text(0.02, 0.01, info, transform=ax.transAxes)
 
@@ -803,7 +815,7 @@ def apply_ctps_select_ic(fname_ctps, threshold=0.1):
 #
 #######################################################
 def apply_ica_select_brain_response(fname_clean_raw, n_pca_components=None,
-                                    conditions=['trigger'], include=None):
+                                    conditions=['trigger'], event_id=1, include=None):
 
     ''' Performs ICA recomposition with selected brain response components to a list of (ICA) files.
         fname_clean_raw: raw data after ECG and EOG rejection.
@@ -854,7 +866,7 @@ def apply_ica_select_brain_response(fname_clean_raw, n_pca_components=None,
                                               ICA components for brain\
                                               responses only.'
         meg_clean.save(fnclean_eve, overwrite=True)
-        plot_compare_brain_responses(fname_clean_raw, fnclean_eve)
+        plot_compare_brain_responses(fname_clean_raw, fnclean_eve, event_id=event_id)
 
 
 #######################################################
@@ -862,8 +874,8 @@ def apply_ica_select_brain_response(fname_clean_raw, n_pca_components=None,
 # interface for creating the noise-covariance matrix  #
 #                                                     #
 #######################################################
-def apply_create_noise_covariance(fname_empty_room, require_filter=True,
-                                  verbose=None):
+def apply_create_noise_covariance(fname_empty_room, require_filter=False,
+                                  require_noise_reducer=False, verbose=None):
 
     '''
     Creates the noise covariance matrix from an empty room file.
@@ -872,9 +884,16 @@ def apply_create_noise_covariance(fname_empty_room, require_filter=True,
     ----------
     fname_empty_room : String containing the filename
         of the empty room file (must be a fif-file)
+        File name should end with -raw.fif in order to have proper output filenames.
     require_filter: bool
         If true, the empy room file is filtered before calculating
         the covariance matrix. (Beware, filter settings are fixed.)
+    require_noise_reducer: bool
+        If true, a noise reducer is applied on the empty room file.
+        The noise reducer frequencies are fixed to 50Hz, 60Hz and
+        to frequencies less than 5Hz i.e. the reference channels are filtered to
+        these frequency ranges and then signal obtained is removed from
+        the empty room raw data. For more information please check the jumeg noise reducer.
     verbose : bool, str, int, or None
         If not None, override default verbose level
         (see mne.verbose).
@@ -887,9 +906,9 @@ def apply_create_noise_covariance(fname_empty_room, require_filter=True,
     from mne import compute_raw_data_covariance as cp_covariance
     from mne import write_cov, pick_types
     from mne.io import Raw
+    from jumeg.jumeg_noise_reducer import noise_reducer
 
     fner = get_files_from_list(fname_empty_room)
-
     nfiles = len(fner)
 
     # loop across all filenames
@@ -904,7 +923,14 @@ def apply_create_noise_covariance(fname_empty_room, require_filter=True,
             # filter empty room raw data
             apply_filter(fn_in, flow=1, fhigh=45, order=4, njobs=4)
             # reconstruct empty room file name accordingly
-            fn_in = fn_in.split('-')[0] + ',fibp1-45-empty.fif'
+            fn_in = fn_in[:fn_in.rfind(ext_empty_raw)] + ',fibp1-45-raw.fif'
+
+        if require_noise_reducer:
+            fn_empty_nr = fn_in[:fn_in.rfind(ext_empty_raw)] + ',nr-raw.fif'
+            noise_reducer(fn_in, refnotch=50, detrending=False, fnout=fn_empty_nr)
+            noise_reducer(fn_empty_nr, refnotch=60, detrending=False, fnout=fn_empty_nr)
+            noise_reducer(fn_empty_nr, reflp=5, fnout=fn_empty_nr)
+            fn_in = fn_empty_nr
 
         # file name for saving noise_cov
         fn_out = fn_in[:fn_in.rfind(ext_empty_raw)] + ext_empty_cov
@@ -921,3 +947,28 @@ def apply_create_noise_covariance(fname_empty_room, require_filter=True,
 
         # write noise-covariance matrix to disk
         write_cov(fn_out, noise_cov_mat)
+
+
+def apply_empty_room_projections(raw, raw_empty_room):
+    '''
+    Calculates empty room projections from empty room data and applies it to raw.
+    Note: Make sure the empty room data is also filtered. This may affect the projections.
+
+    Input
+    -----
+    raw, raw_empty_room: mne Raw object
+        Raw file and Empty room raw file.
+
+    Returns
+    -------
+    raw: mne Raw object
+        Raw file with projections applied.
+    empty_room_proj: projections
+        Empty room projection vectors.
+    '''
+    # Add checks to make sure its empty room.
+    # Check for events in ECG, EOG, STI.
+    print 'Empty room projections calculated for %s.'%(raw_empty_room)
+    empty_room_proj = mne.compute_proj_raw(raw_empty_room)
+    raw.add_proj(empty_room_proj).apply_proj()
+    return raw, empty_room_proj

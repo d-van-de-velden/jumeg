@@ -1,6 +1,6 @@
 # Authors: Lukas Breuer <l.breuer@fz-juelich.de>
 '''
-Created on 28.11.2014
+Created on 27.11.2015
 
 @author: lbreuer
 '''
@@ -23,19 +23,26 @@ import numpy as np
 #                    a data array                     #
 #                                                     #
 #######################################################
-def ica_array(data_orig, explainedVar=1.0, overwrite=None,
+def ica_array(data_orig, dim_reduction='',
+              explainedVar=1.0, overwrite=None,
               max_pca_components=None, method='infomax',
               cost_func='logcosh', weights=None, lrate=None,
               block=None, wchange=1e-16, annealdeg=60.,
               annealstep=0.9, n_subgauss=1, kurt_size=6000,
-              maxsteps=200, verbose=True):
+              maxsteps=200, pca=None, verbose=True):
 
     """
-    interface to perform (extended) Infomax ICA on a data array
+    interface to perform (extended) Infomax or FastICA on a data array
 
         Parameters
         ----------
         data_orig : array of data to be decomposed [nchan, ntsl].
+        dim_reduction : {'', 'AIC', 'BIC', 'GAP', 'MDL', 'MIBS', 'explVar'}
+            Method for dimension selection. For further information about
+            the methods please check the script 'dimension_selection.py'.
+            default: dim_reduction='' --> no dimension reduction is performed
+                                          as long as not the parameter
+                                          'max_pca_components' is set.
         explainedVar : float
             Value between 0 and 1; components will be selected by the
             cumulative percentage of explained variance.
@@ -45,7 +52,8 @@ def ica_array(data_orig, explainedVar=1.0, overwrite=None,
         max_pca_components : int | None
             The number of components used for PCA decomposition. If None, no
             dimension reduction will be applied and max_pca_components will equal
-            the number of channels supplied on decomposing data.
+            the number of channels supplied on decomposing data. Only of interest
+            when dim_reduction=''
         method : {'fastica', 'infomax', 'extended-infomax'}
           The ICA method to use. Defaults to 'infomax'.
 
@@ -115,9 +123,23 @@ def ica_array(data_orig, explainedVar=1.0, overwrite=None,
     # -------------------------------------------
     # perform centering and whitening of the data
     # -------------------------------------------
-    if verbose:
-        print "     ... perform centering and whitening ..."
-    data, pca = whitening(data.T, npc=max_pca_components, explainedVar=explainedVar)
+    if pca:
+        # perform centering and whitening
+        dmean = data.mean(axis=-1)
+        stddev = np.std(data, axis=-1)
+        dnorm = (data - dmean[:, np.newaxis])/stddev[:, np.newaxis]
+        data = np.dot(dnorm.T, pca.components_[:max_pca_components].T)
+
+        # update mean and standard-deviation in PCA object
+        pca.mean_ = dmean
+        pca.stddev_ = stddev
+
+    else:
+        if verbose:
+            print "     ... perform centering and whitening ..."
+
+        data, pca = whitening(data.T, dim_reduction=dim_reduction, npc=max_pca_components,
+                              explainedVar=explainedVar)
 
 
     # -------------------------------------------
@@ -222,7 +244,8 @@ def infomax2data(weights, pca, activations, idx_zero=None):
 # routine for PCA decomposition prior to ICA          #
 #                                                     #
 #######################################################
-def whitening(data, npc=None, explainedVar=None):
+def whitening(data, dim_reduction='',
+              npc=None, explainedVar=1.0):
 
     """
     routine to perform whitening prior to Infomax ICA application
@@ -232,10 +255,16 @@ def whitening(data, npc=None, explainedVar=None):
         Parameters
         ----------
         X : data array [ntsl, nchan] for decomposition.
+        dim_reduction : {'', 'AIC', 'BIC', 'GAP', 'MDL', 'MIBS', 'explVar'}
+            Method for dimension selection. For further information about
+            the methods please check the script 'dimension_selection.py'.
+            default: dim_reduction='' --> no dimension reduction is performed as
+                                          long as not the parameter 'npc' is set.
         npc : int | None
             The number of components used for PCA decomposition. If None, no
             dimension reduction will be applied and max_pca_components will equal
-            the number of channels supplied on decomposing data.
+            the number of channels supplied on decomposing data. Only of interest
+            when dim_reduction=''
             default: npc = None
         explainedVar : float | None
             Must be between 0 and 1. If float, the number of components
@@ -257,6 +286,7 @@ def whitening(data, npc=None, explainedVar=None):
     # import necessary modules
     # -------------------------------------------
     from sklearn.decomposition import RandomizedPCA
+    import dimension_selection as dim_sel
 
 
     # -------------------------------------------
@@ -273,7 +303,7 @@ def whitening(data, npc=None, explainedVar=None):
     # -------------------------------------------
     X = data.copy()
     whiten = False
-    n_components = npc
+    n_components = None if dim_reduction == '' else npc
     dmean = X.mean(axis=0)
     stddev = np.std(X, axis=0)
     X = (X - dmean[np.newaxis, :]) / stddev[np.newaxis, :]
@@ -294,9 +324,21 @@ def whitening(data, npc=None, explainedVar=None):
     pca.stddev_ = stddev
 
     # -------------------------------------------
-    # check explained variance
+    # check dimension selection
     # -------------------------------------------
-    if explainedVar:
+    if dim_reduction == 'AIC':
+        npc, _ = dim_sel.aic_mdl(pca.explained_variance_)
+    elif dim_reduction == 'BIC':
+        npc = dim_sel.mibs(pca.explained_variance_, ntsl,
+                           use_bic=True)
+    elif dim_reduction == 'GAP':
+        npc = dim_sel.gap(pca.explained_variance_)
+    elif dim_reduction == 'MDL':
+        _, npc = dim_sel.aic_mdl(pca.explained_variance_)
+    elif dim_reduction == 'MIBS':
+        npc = dim_sel.mibs(pca.explained_variance_, ntsl,
+                           use_bic=False)
+    elif dim_reduction == 'explVar':
         # compute explained variance manually
         explained_variance_ratio_ = pca.explained_variance_
         explained_variance_ratio_ /= explained_variance_ratio_.sum()
@@ -319,8 +361,8 @@ def infomax(data, weights=None, l_rate=None, block=None, w_change=1e-12,
             anneal_deg=60., anneal_step=0.9, extended=False, n_subgauss=1,
             kurt_size=6000, ext_blocks=1, max_iter=200,
             fixed_random_state=None, verbose=None):
-    """Run the (extended) Infomax ICA decomposition on raw data
-
+    """
+    Run the (extended) Infomax ICA decomposition on raw data
     based on the publications of Bell & Sejnowski 1995 (Infomax)
     and Lee, Girolami & Sejnowski, 1999 (extended Infomax)
 
@@ -377,7 +419,7 @@ def infomax(data, weights=None, l_rate=None, block=None, w_change=1e-12,
     min_l_rate = 1e-10
     blowup = 1e4
     blowup_fac = 0.5
-    n_small_angle = 20
+    n_small_angle = 200
     degconst = 180.0 / np.pi
 
     # for extended Infomax
@@ -524,6 +566,15 @@ def infomax(data, weights=None, l_rate=None, block=None, w_change=1e-12,
             angledelta = 0.0
             delta = oldwtchange.reshape(1, n_features_square)
             change = np.sum(delta * delta, dtype=np.float64)
+
+            if verbose:
+                from sys import stdout
+                info = "\r" if iter > 0 else ""
+                info += ">>> Step %4d of %4d; wchange: %1.4e" % (step+1, max_iter, change)
+                stdout.write(info)
+                stdout.flush()
+
+
             if step > 1:
                 angledelta = math.acos(np.sum(delta * olddelta) /
                                        math.sqrt(change * oldchange))
@@ -575,6 +626,7 @@ def infomax(data, weights=None, l_rate=None, block=None, w_change=1e-12,
             else:
                 raise ValueError('Error in Infomax ICA: unmixing_matrix matrix'
                                  'might not be invertible!')
+
 
     # prepare return values
     return weights.T

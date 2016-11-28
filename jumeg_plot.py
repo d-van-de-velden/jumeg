@@ -13,6 +13,10 @@ from jumeg.jumeg_base import jumeg_base
 from jumeg_math import (calc_performance,
                         calc_frequency_correlation)
 
+try:
+    import glassbrain
+except Exception as e:
+    print ('Unable to import glassbrain check mayavi and pysurfer config.')
 
 def plot_powerspectrum(fname, raw=None, picks=None, dir_plots="plots",
                        tmin=None, tmax=None, fmin=0.0, fmax=450.0, n_fft=4096):
@@ -87,7 +91,8 @@ def plot_average(filenames, save_plot=True, show_plot=False, dpi=100):
 
 def plot_performance_artifact_rejection(meg_raw, ica, fnout_fig,
                                         meg_clean=None, show=False,
-                                        proj=False, verbose=False):
+                                        proj=False, verbose=False,
+                                        name_ecg='ECG 001', name_eog='EOG 002'):
     '''
     Creates a performance image of the data before
     and after the cleaning process.
@@ -96,9 +101,9 @@ def plot_performance_artifact_rejection(meg_raw, ica, fnout_fig,
     from mne.preprocessing import find_ecg_events, find_eog_events
     from jumeg import jumeg_math as jmath
 
-    name_ecg = 'ECG 001'
-    name_eog_hor = 'EOG 001'
-    name_eog_ver = 'EOG 002'
+    # name_ecg = 'ECG 001'
+    # name_eog_hor = 'EOG 001'
+    # name_eog_ver = 'EOG 002'
     event_id_ecg = 999
     event_id_eog = 998
     tmin_ecg = -0.4
@@ -115,8 +120,7 @@ def plot_performance_artifact_rejection(meg_raw, ica, fnout_fig,
     else:
         meg_clean_given = False
         meg_clean = ica.apply(meg_raw, exclude=ica.exclude,
-                              n_pca_components=ica.n_components_,
-                              copy=True)
+                              n_pca_components=ica.n_components_)
 
     # plotting parameter
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
@@ -133,7 +137,7 @@ def plot_performance_artifact_rejection(meg_raw, ica, fnout_fig,
         nrange = 1
 
     # EOG
-    if name_eog_ver in ch_names:
+    if name_eog in ch_names:
         nrange = 2
 
     y_figsize = 6 * nrange
@@ -163,9 +167,9 @@ def plot_performance_artifact_rejection(meg_raw, ica, fnout_fig,
         elif i == 1:
             baseline = (None, None)
             event_id = event_id_eog
-            idx_event = find_eog_events(meg_raw, event_id, ch_name=name_eog_ver,
+            idx_event = find_eog_events(meg_raw, event_id, ch_name=name_eog,
                                         verbose=verbose)
-            idx_ref_chan = meg_raw.ch_names.index(name_eog_ver)
+            idx_ref_chan = meg_raw.ch_names.index(name_eog)
             tmin = tmin_eog
             tmax = tmax_eog
             pl1 = nrange * 100 + 21 + (nrange - nstart - 1) * 2
@@ -505,3 +509,40 @@ def draw_matrix(mat, th1=None, th2=None, clim=None, cmap=None):
         ax.set_clim(*clim)
     pl.colorbar()
     return ax
+
+
+def plot_intersection_matrix(mylabels):
+    '''
+    Plots matrix showing intersections/ overlaps between labels
+    in the same hemisphere, all the labels are unique
+    this means that no labels reduction is possible.
+    '''
+    import matplotlib.pyplot as pl
+    import itertools
+
+    length = len(mylabels)
+    intersection_matrix = np.zeros((length, length))
+    for i, j in itertools.product(range(length), range(length)):
+        if mylabels[i].hemi == mylabels[j].hemi:
+            intersection_matrix[i][j] = np.intersect1d(mylabels[i].vertices,
+                                                       mylabels[j].vertices).size
+        else:
+            intersection_matrix[i][j] = 0
+    pl.spy(intersection_matrix)
+    pl.show()
+    return intersection_matrix
+
+
+def plot_matrix_with_values(mat, cmap='seismic', colorbar=True):
+    '''
+    Show a matrix with text inside showing the values of the matrix
+    may be useful for showing connectivity maps.
+    '''
+    import matplotlib.pyplot as pl
+    fig, ax = pl.subplots()
+    im = ax.matshow(mat, cmap=cmap)
+    if colorbar:
+        pl.colorbar(im)
+    for (a, b), z in np.ndenumerate(mat):
+        ax.text(b, a, z, ha='center', va='center')
+    pl.show()

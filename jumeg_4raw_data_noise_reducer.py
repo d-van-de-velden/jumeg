@@ -1,11 +1,17 @@
 '''
 ----------------------------------------------------------------------
---- jumeg.jumeg_noise_reducer --------------------------------
+--- jumeg.jumeg_4raw_data_noise_reducer
+--- modified by FB
+----> interface for use of only one raw obj or one fif file
+----> use most jumeg_base cls functions  
+----------------------------------------------------------------------
+
+--- !!! featuring the one and olny magic EE <jumeg.jumeg_noise_reducer>
 ----------------------------------------------------------------------
  author     : Eberhard Eich
  email      : e.eich@fz-juelich.de
- last update: 14.06.2016
- version    : 1.4
+ last update: 17.07.2015
+ version    : 1.3
 
 ----------------------------------------------------------------------
  Based on following publications:
@@ -57,6 +63,7 @@ from mne.utils import logger
 from mne.epochs import _is_good
 from mne.io.pick import channel_indices_by_type
 from jumeg.jumeg_utils import get_files_from_list
+from jumeg.jumeg_base  import jumeg_base
 
 TINY = 1.e-38
 SVD_RELCUTOFF = 1.e-08
@@ -68,7 +75,7 @@ SVD_RELCUTOFF = 1.e-08
 # after noise reduction
 #
 ##################################################
-def plot_denoising(fname_raw, fmin=0, fmax=300, tmin=0.0, tmax=60.0,
+def plot_denoising_4raw_data(fname_raw, fmin=0, fmax=300, tmin=0.0, tmax=60.0,
                    proj=False, n_fft=4096, color='blue',
                    stim_name=None, event_id=1,
                    tmin_stim=-0.2, tmax_stim=0.5,
@@ -125,7 +132,7 @@ def plot_denoising(fname_raw, fmin=0, fmax=300, tmin=0.0, tmax=60.0,
 
     from matplotlib import gridspec as grd
     import matplotlib.pyplot as plt
-    from mne.time_frequency import psd_welch
+    from mne.time_frequency import compute_raw_psd
 
     fnraw = get_files_from_list(fname_raw)
 
@@ -146,9 +153,9 @@ def plot_denoising(fname_raw, fmin=0, fmax=300, tmin=0.0, tmax=60.0,
         if area_mode not in [None, 'std', 'range']:
             raise ValueError('"area_mode" must be "std", "range", or None')
 
-        psds, freqs = psd_welch(raw, picks=picks, fmin=fmin, fmax=fmax,
-                                tmin=tmin, tmax=tmax, n_fft=n_fft,
-                                n_jobs=n_jobs, proj=proj)
+        psds, freqs = compute_raw_psd(raw, picks=picks, fmin=fmin, fmax=fmax,
+                                      tmin=tmin, tmax=tmax, n_fft=n_fft,
+                                      n_jobs=n_jobs, proj=proj)
         psds_all.append(psds)
         freqs_all.append(freqs)
 
@@ -237,36 +244,32 @@ def plot_denoising(fname_raw, fmin=0, fmax=300, tmin=0.0, tmax=60.0,
 ##################################################
 #
 # routine to detrend the data
-#
+# update fb:
+# ---> new key raw=raw
+# ---> getting raw obj with jume_base cls
+# ---> selecting poicks via jumeg_base cls
+# ---> saving raw use jumeg_base cls
 ##################################################
-def perform_detrending(fname_raw, save=True):
+def perform_detrending(fname_raw,raw=None,save=True):
 
     from mne.io import Raw
     from numpy import poly1d, polyfit
-
-    fnraw = get_files_from_list(fname_raw)
-
-    # loop across all filenames
-    for fname in fnraw:
-
-        # read data in
-        raw = Raw(fname, preload=True)
-
-        # get channels
-        picks = mne.pick_types(raw.info, meg='mag', ref_meg=True, eeg=False, stim=False,
-                               eog=False, exclude='bads')
-        xval = np.arange(raw._data.shape[1])
-
-        # loop over all channels
-        for ipick in picks:
-            coeff = polyfit(xval, raw._data[ipick, :], deg=1)
-            trend = poly1d(coeff)
-            raw._data[ipick, :] -= trend(xval)
+    
+    raw = jumeg_base.get_raw_obj(fname_raw,raw=raw)
+  # get channels
+    picks = jumeg_base.pick_meg_and_ref_nobads()
+    
+    xval  = np.arange(raw._data.shape[1])
+  # loop over all channels
+    for ipick in picks:
+        coeff = polyfit(xval, raw._data[ipick, :], deg=1)
+        trend = poly1d(coeff)
+        raw._data[ipick, :] -= trend(xval)
 
     # save detrended data
     if save:
-        fnout = fname_raw[:fname_raw.rfind('-raw.fif')] + ',dt-raw.fif'
-        raw.save(fnout, overwrite=True)
+       fname_out = jumeg_base.get_fif_name(raw=raw,postfix='dt')
+       jume_base.apply_save_mne_data(raw,fname=fname_out,overwrite=True)
 
     return raw
 
@@ -319,20 +322,26 @@ def channel_indices_from_list(fulllist, findlist, excllist=None):
 #
 # Apply noise reduction to signal channels
 # using reference channels.
+# !!! ONLY ONE RAW Obj Interface Version FB !!!
 #
 ##################################################
-def noise_reducer(fname_raw, raw=None, signals=[], noiseref=[], detrending=None,
-                  tmin=None, tmax=None, reflp=None, refhp=None, refnotch=None,
-                  exclude_artifacts=True, checkresults=True, return_raw=False,
-                  complementary_signal=False, fnout=None, verbose=False):
+def noise_reducer_4raw_data(fname_raw,raw=None,signals=[],noiseref=[],detrending=None,
+                  tmin=None,tmax=None,reflp=None,refhp=None,refnotch=None,
+                  exclude_artifacts=True,checkresults=True,
+                  fif_extention="-raw.fif",fif_postfix="nr",                        
+                  reject={'grad':4000e-13,'mag':4e-12,'eeg':40e-6,'eog':250e-6},
+                  complementary_signal=False,fnout=None,verbose=False,save=True):
 
     """Apply noise reduction to signal channels using reference channels.
-
+        
+       !!! ONLY ONE RAW Obj Interface Version FB !!!
+           
     Parameters
     ----------
-    fname_raw : (list of) rawfile names
-    raw : mne Raw objects
-        Allows passing of raw object as well.
+    fname_raw : rawfile name
+
+    raw     : fif raw object
+
     signals : list of string
               List of channels to compensate using noiseref.
               If empty use the meg signal channels.
@@ -354,22 +363,26 @@ def noise_reducer(fname_raw, raw=None, signals=[], noiseref=[], detrending=None,
                use raw(ref)-notched(ref) as reference signal
     exclude_artifacts: filter signal-channels thru _is_good() [True]
                        (parameters are at present hard-coded!)
-    return_raw : bool
-        If return_raw is true, the raw object is returned and raw file
-        is not written to disk. It is suggested that this option be used in cases
-        where the noise_reducer is applied multiple times. [False]
     complementary_signal : replaced signal by traces that would be subtracted [False]
                            (can be useful for debugging)
-    detrending: boolean to ctrl subtraction of linear trend from all magn. chans [False]
     checkresults : boolean to control internal checks and overall success [True]
 
-    Outputfile
-    ----------
+    reject =  dict for rejection threshold 
+              units:
+              grad:    T / m (gradiometers)
+              mag:     T (magnetometers)
+              eeg/eog: uV (EEG channels)
+              default=>{'grad':4000e-13,'mag':4e-12,'eeg':40e-6,'eog':250e-6}
+              
+    save : save data to fif file
+
+    Outputfile:
+    -------
     <wawa>,nr-raw.fif for input <wawa>-raw.fif
 
     Returns
     -------
-    If return_raw is True, then mne.io.Raw instance is returned.
+    TBD
 
     Bugs
     ----
@@ -378,367 +391,337 @@ def noise_reducer(fname_raw, raw=None, signals=[], noiseref=[], detrending=None,
     - non existing input file handled ungracefully
     """
 
+    tc0 = time.clock()
+    tw0 = time.time()
+
     if type(complementary_signal) != bool:
         raise ValueError("Argument complementary_signal must be of type bool")
 
-    # handle error if Raw object passed with file list
-    if raw and isinstance(fname_raw, list):
-        raise ValueError('List of file names cannot be combined with one Raw object')
+    raw,fname_raw = jumeg_base.get_raw_obj(fname_raw,raw=raw)
+    
+    
+    if detrending:
+       raw = perform_detrending(None,raw=raw, save=False)
+    
+    tc1 = time.clock()
+    tw1 = time.time()
 
-    # handle error if return_raw is requested with file list
-    if return_raw and isinstance(fname_raw, list):
-        raise ValueError('List of file names cannot be combined return_raw.'
-                         'Please pass one file at a time.')
+    if verbose:
+       print ">>> loading raw data took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tc0), (tw1 - tw0))
 
-    # handle error if Raw object is passed with detrending option
-    #TODO include perform_detrending for Raw objects
-    if raw and detrending:
-        raise ValueError('Please perform detrending on the raw file directly. Cannot perform'
-                         'detrending on the raw object')
+    # Time window selection
+    # weights are calc'd based on [tmin,tmax], but applied to the entire data set.
+    # tstep is used in artifact detection
+    # tmin,tmax variables must not be changed here!
+    if tmin is None:
+        itmin = 0
+    else:
+        itmin = int(floor(tmin * raw.info['sfreq']))
+    if tmax is None:
+        itmax = raw.last_samp
+    else:
+        itmax = int(ceil(tmax * raw.info['sfreq']))
 
-    fnraw = get_files_from_list(fname_raw)
+    if itmax - itmin < 2:
+        raise ValueError("Time-window for noise compensation empty or too short")
 
-    # loop across all filenames
-    for fname in fnraw:
+    if verbose:
+        print ">>> Set time-range to [%7.3f,%7.3f]" % \
+              (raw.index_as_time(itmin)[0], raw.index_as_time(itmax)[0])
 
+    if signals is None or len(signals) == 0:
+        sigpick = jumeg_base.pick_meg_nobads(raw)
+    else:
+        sigpick = channel_indices_from_list(raw.info['ch_names'][:], signals,
+                                            raw.info.get('bads'))
+    nsig = len(sigpick)
+    if nsig == 0:
+        raise ValueError("No channel selected for noise compensation")
+
+    if noiseref is None or len(noiseref) == 0:
+        # References are not limited to 4D ref-chans, but can be anything,
+        # incl. ECG or powerline monitor.
         if verbose:
-            print "########## Read raw data:"
+            print ">>> Using all refchans."
+            
+        refexclude = "bads"      
+        refpick = jumeg_base.pick_ref_nobads(raw)
+    else:
+        refpick = channel_indices_from_list(raw.info['ch_names'][:], noiseref,
+                                            raw.info.get('bads'))
+    nref = len(refpick)
+    if nref == 0:
+        raise ValueError("No channel selected as noise reference")
 
-        tc0 = time.clock()
-        tw0 = time.time()
+    if verbose:
+        print ">>> sigpick: %3d chans, refpick: %3d chans" % (nsig, nref)
 
-        if raw is None:
-            if detrending:
-                raw = perform_detrending(fname, save=False)
-            else:
-                raw = mne.io.Raw(fname, preload=True)
-        else:
-            # perform sanity check to make sure Raw object and file are same
-            if os.path.basename(fname) != os.path.basename(raw.info['filename']):
-                warnings.warn('The file name within the Raw object and provided'
-                              'fname are not the same. Please check again.')
-
-        tc1 = time.clock()
-        tw1 = time.time()
-
+    if reflp is None and refhp is None and refnotch is None:
+        use_reffilter = False
+        use_refantinotch = False
+    else:
+        use_reffilter = True
         if verbose:
-            print ">>> loading raw data took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tc0), (tw1 - tw0))
+            print "########## Filter reference channels:"
 
-        # Time window selection
-        # weights are calc'd based on [tmin,tmax], but applied to the entire data set.
-        # tstep is used in artifact detection
-        # tmin,tmax variables must not be changed here!
-        if tmin is None:
-            itmin = 0
-        else:
-            itmin = int(floor(tmin * raw.info['sfreq']))
-        if tmax is None:
-            itmax = raw.last_samp
-        else:
-            itmax = int(ceil(tmax * raw.info['sfreq']))
-
-        if itmax - itmin < 2:
-            raise ValueError("Time-window for noise compensation empty or too short")
-
-        if verbose:
-            print ">>> Set time-range to [%7.3f,%7.3f]" % \
-                  (raw.times[itmin], raw.times[itmax])
-
-        if signals is None or len(signals) == 0:
-            sigpick = mne.pick_types(raw.info, meg='mag', eeg=False, stim=False,
-                                     eog=False, exclude='bads')
-        else:
-            sigpick = channel_indices_from_list(raw.info['ch_names'][:], signals,
-                                                raw.info.get('bads'))
-        nsig = len(sigpick)
-        if nsig == 0:
-            raise ValueError("No channel selected for noise compensation")
-
-        if noiseref is None or len(noiseref) == 0:
-            # References are not limited to 4D ref-chans, but can be anything,
-            # incl. ECG or powerline monitor.
-            if verbose:
-                print ">>> Using all refchans."
-            refexclude = "bads"
-            refpick = mne.pick_types(raw.info, ref_meg=True, meg=False, eeg=False,
-                                     stim=False, eog=False, exclude='bads')
-        else:
-            refpick = channel_indices_from_list(raw.info['ch_names'][:], noiseref,
-                                                raw.info.get('bads'))
-        nref = len(refpick)
-        if nref == 0:
-            raise ValueError("No channel selected as noise reference")
-
-        if verbose:
-            print ">>> sigpick: %3d chans, refpick: %3d chans" % (nsig, nref)
-
-        if reflp is None and refhp is None and refnotch is None:
-            use_reffilter = False
-            use_refantinotch = False
-        else:
-            use_reffilter = True
-            if verbose:
-                print "########## Filter reference channels:"
-
-            use_refantinotch = False
-            if refnotch is not None:
-                if reflp is None and reflp is None:
-                    use_refantinotch = True
-                    freqlast = np.min([5.01 * refnotch, 0.5 * raw.info['sfreq']])
-                    if verbose:
-                        print ">>> notches at freq %.1f and harmonics below %.1f" % (refnotch, freqlast)
-                else:
-                    raise ValueError("Cannot specify notch- and high-/low-pass"
-                                     "reference filter together")
-            else:
-                if verbose:
-                    if reflp is not None:
-                        print ">>>  low-pass with cutoff-freq %.1f" % reflp
-                    if refhp is not None:
-                        print ">>> high-pass with cutoff-freq %.1f" % refhp
-
-            # Adapt followg drop-chans cmd to use 'all-but-refpick'
-            droplist = [raw.info['ch_names'][k] for k in xrange(raw.info['nchan']) if not k in refpick]
-            tct = time.clock()
-            twt = time.time()
-            fltref = raw.copy().drop_channels(droplist)
-            if use_refantinotch:
-                rawref = raw.copy().drop_channels(droplist)
+        use_refantinotch = False
+        if refnotch is not None:
+            if reflp is None and reflp is None:
+                use_refantinotch = True
                 freqlast = np.min([5.01 * refnotch, 0.5 * raw.info['sfreq']])
-                fltref.notch_filter(np.arange(refnotch, freqlast, refnotch),
-                                    picks=np.array(xrange(nref)), method='iir')
-                fltref._data = (rawref._data - fltref._data)
+                if verbose:
+                    print ">>> notches at freq %.1f and harmonics below %.1f" % (refnotch, freqlast)
             else:
-                fltref.filter(refhp, reflp, picks=np.array(xrange(nref)), method='iir')
-            tc1 = time.clock()
-            tw1 = time.time()
+                raise ValueError("Cannot specify notch- and high-/low-pass"
+                                 "reference filter together")
+        else:
             if verbose:
-                print ">>> filtering ref-chans  took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
+                if reflp is not None:
+                    print ">>>  low-pass with cutoff-freq %.1f" % reflp
+                if refhp is not None:
+                    print ">>> high-pass with cutoff-freq %.1f" % refhp
 
-        if verbose:
-            print "########## Calculating sig-ref/ref-ref-channel covariances:"
-        # Calculate sig-ref/ref-ref-channel covariance:
-        # (there is no need to calc inter-signal-chan cov,
-        #  but there seems to be no appropriat fct available)
-        # Here we copy the idea from compute_raw_data_covariance()
-        # and truncate it as appropriate.
+        # Adapt followg drop-chans cmd to use 'all-but-refpick'
+        droplist = [raw.info['ch_names'][k] for k in xrange(raw.info['nchan']) if not k in refpick]
         tct = time.clock()
         twt = time.time()
-        # The following reject and infosig entries are only
-        # used in _is_good-calls.
-        # _is_good() from mne-0.9.git-py2.7.egg/mne/epochs.py seems to
-        # ignore ref-channels (not covered by dict) and checks individual
-        # data segments - artifacts across a buffer boundary are not found.
-        reject = dict(grad=4000e-13, # T / m (gradiometers)
-                      mag=4e-12,     # T (magnetometers)
-                      eeg=40e-6,     # uV (EEG channels)
-                      eog=250e-6)    # uV (EOG channels)
+        fltref = raw.drop_channels(droplist, copy=True)
+        if use_refantinotch:
+            rawref = raw.drop_channels(droplist, copy=True)
+            freqlast = np.min([5.01 * refnotch, 0.5 * raw.info['sfreq']])
+            fltref.notch_filter(np.arange(refnotch, freqlast, refnotch),
+                                picks=np.array(xrange(nref)), method='iir')
+            fltref._data = (rawref._data - fltref._data)
+        else:
+            fltref.filter(refhp, reflp, picks=np.array(xrange(nref)), method='iir')
+        tc1 = time.clock()
+        tw1 = time.time()
+        if verbose:
+            print ">>> filtering ref-chans  took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
 
-        infosig = copy.copy(raw.info)
-        infosig['chs'] = [raw.info['chs'][k] for k in sigpick]
-        infosig['ch_names'] = [raw.info['ch_names'][k] for k in sigpick]
-        infosig['nchan'] = len(sigpick)
-        idx_by_typesig = channel_indices_by_type(infosig)
+    if verbose:
+        print "########## Calculating sig-ref/ref-ref-channel covariances:"
+    # Calculate sig-ref/ref-ref-channel covariance:
+    # (there is no need to calc inter-signal-chan cov,
+    #  but there seems to be no appropriat fct available)
+    # Here we copy the idea from compute_raw_data_covariance()
+    # and truncate it as appropriate.
+    tct = time.clock()
+    twt = time.time()
+    # The following reject and infosig entries are only
+    # used in _is_good-calls.
+    # _is_good() from mne-0.9.git-py2.7.egg/mne/epochs.py seems to
+    # ignore ref-channels (not covered by dict) and checks individual
+    # data segments - artifacts across a buffer boundary are not found.
+    
+    #--- !!! FB put to kwargs    
+    
+    #reject = dict(grad=4000e-13, # T / m (gradiometers)
+    #              mag=4e-12,     # T (magnetometers)
+    #              eeg=40e-6,     # uV (EEG channels)
+    #              eog=250e-6)    # uV (EOG channels)
 
-        # Read data in chunks:
-        tstep = 0.2
-        itstep = int(ceil(tstep * raw.info['sfreq']))
+    infosig = copy.copy(raw.info)
+    infosig['chs'] = [raw.info['chs'][k] for k in sigpick]
+    infosig['ch_names'] = [raw.info['ch_names'][k] for k in sigpick]
+    infosig['nchan'] = len(sigpick)
+    idx_by_typesig = channel_indices_by_type(infosig)
+
+    # Read data in chunks:
+    tstep = 0.2
+    itstep = int(ceil(tstep * raw.info['sfreq']))
+    sigmean = 0
+    refmean = 0
+    sscovdata = 0
+    srcovdata = 0
+    rrcovdata = 0
+    n_samples = 0
+
+    for first in range(itmin, itmax, itstep):
+        last = first + itstep
+        if last >= itmax:
+            last = itmax
+        raw_segmentsig, times = raw[sigpick, first:last]
+        if use_reffilter:
+            raw_segmentref, times = fltref[:, first:last]
+        else:
+            raw_segmentref, times = raw[refpick, first:last]
+
+        if not exclude_artifacts or \
+           _is_good(raw_segmentsig, infosig['ch_names'], idx_by_typesig, reject, flat=None,
+                    ignore_chs=raw.info['bads']):
+            sigmean += raw_segmentsig.sum(axis=1)
+            refmean += raw_segmentref.sum(axis=1)
+            sscovdata += (raw_segmentsig * raw_segmentsig).sum(axis=1)
+            srcovdata += np.dot(raw_segmentsig, raw_segmentref.T)
+            rrcovdata += np.dot(raw_segmentref, raw_segmentref.T)
+            n_samples += raw_segmentsig.shape[1]
+        else:
+            logger.info("Artefact detected in [%d, %d]" % (first, last))
+    if n_samples <= 1:
+        raise ValueError('Too few samples to calculate weights')
+    sigmean /= n_samples
+    refmean /= n_samples
+    sscovdata -= n_samples * sigmean[:] * sigmean[:]
+    sscovdata /= (n_samples - 1)
+    srcovdata -= n_samples * sigmean[:, None] * refmean[None, :]
+    srcovdata /= (n_samples - 1)
+    rrcovdata -= n_samples * refmean[:, None] * refmean[None, :]
+    rrcovdata /= (n_samples - 1)
+    sscovinit = np.copy(sscovdata)
+    if verbose:
+        print ">>> Normalize srcov..."
+
+    rrslope = copy.copy(rrcovdata)
+    for iref in xrange(nref):
+        dtmp = rrcovdata[iref, iref]
+        if dtmp > TINY:
+            srcovdata[:, iref] /= dtmp
+            rrslope[:, iref] /= dtmp
+        else:
+            srcovdata[:, iref] = 0.
+            rrslope[:, iref] = 0.
+
+    if verbose:
+        print ">>> Number of samples used : %d" % n_samples
+        tc1 = time.clock()
+        tw1 = time.time()
+        print ">>> sigrefchn covar-calc took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
+
+    if checkresults:
+        if verbose:
+            print "########## Calculated initial signal channel covariance:"
+            # Calculate initial signal channel covariance:
+            # (only used as quality measure)
+            print ">>> initl rt(avg sig pwr) = %12.5e" % np.sqrt(np.mean(sscovdata))
+            for i in xrange(5):
+                print ">>> initl signal-rms[%3d] = %12.5e" % (i, np.sqrt(sscovdata.flatten()[i]))
+            print ">>>"
+
+    U, s, V = np.linalg.svd(rrslope, full_matrices=True)
+    if verbose:
+        print ">>> singular values:"
+        print s
+        print ">>> Applying cutoff for smallest SVs:"
+
+    dtmp = s.max() * SVD_RELCUTOFF
+    s *= (abs(s) >= dtmp)
+    sinv = [1. / s[k] if s[k] != 0. else 0. for k in xrange(nref)]
+    if verbose:
+        print ">>> singular values (after cutoff):"
+        print s
+
+    stat = np.allclose(rrslope, np.dot(U, np.dot(np.diag(s), V)))
+    if verbose:
+        print ">>> Testing svd-result: %s" % stat
+        if not stat:
+            print "    (Maybe due to SV-cutoff?)"
+
+    # Solve for inverse coefficients:
+    # Set RRinv.tr=U diag(sinv) V
+    RRinv = np.transpose(np.dot(U, np.dot(np.diag(sinv), V)))
+    if checkresults:
+        stat = np.allclose(np.identity(nref), np.dot(RRinv, rrslope))
+        if stat:
+            if verbose:
+                print ">>> Testing RRinv-result (should be unit-matrix): ok"
+        else:
+            print ">>> Testing RRinv-result (should be unit-matrix): failed"
+            print np.transpose(np.dot(RRinv, rrslope))
+            print ">>>"
+
+    if verbose:
+        print "########## Calc weight matrix..."
+
+    # weights-matrix will be somewhat larger than necessary,
+    # (to simplify indexing in compensation loop):
+    weights = np.zeros((raw._data.shape[0], nref))
+    for isig in xrange(nsig):
+        for iref in xrange(nref):
+            weights[sigpick[isig],iref] = np.dot(srcovdata[isig,:], RRinv[:,iref])
+
+    if verbose:
+        print "########## Compensating signal channels:"
+        if complementary_signal:
+            print ">>> Caveat: REPLACING signal by compensation signal"
+
+    tct = time.clock()
+    twt = time.time()
+
+    # Work on entire data stream:
+    for isl in xrange(raw._data.shape[1]):
+        slice = np.take(raw._data, [isl], axis=1)
+        if use_reffilter:
+            refslice = np.take(fltref._data, [isl], axis=1)
+            refarr = refslice[:].flatten() - refmean
+            # refarr = fltres[:,isl]-refmean
+        else:
+            refarr = slice[refpick].flatten() - refmean
+        subrefarr = np.dot(weights[:], refarr)
+
+        if not complementary_signal:
+            raw._data[:, isl] -= subrefarr
+        else:
+            raw._data[:, isl] = subrefarr
+
+        if (isl % 10000 == 0) and verbose:
+            print "\rProcessed slice %6d" % isl
+
+    if verbose:
+        print "\nDone."
+        tc1 = time.clock()
+        tw1 = time.time()
+        print ">>> compensation loop took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
+
+    if checkresults:
+        if verbose:
+            print "########## Calculating final signal channel covariance:"
+        # Calculate final signal channel covariance:
+        # (only used as quality measure)
+        tct = time.clock()
+        twt = time.time()
         sigmean = 0
-        refmean = 0
         sscovdata = 0
-        srcovdata = 0
-        rrcovdata = 0
         n_samples = 0
-
         for first in range(itmin, itmax, itstep):
             last = first + itstep
             if last >= itmax:
                 last = itmax
             raw_segmentsig, times = raw[sigpick, first:last]
-            if use_reffilter:
-                raw_segmentref, times = fltref[:, first:last]
-            else:
-                raw_segmentref, times = raw[refpick, first:last]
-
+            # Artifacts found here will probably differ from pre-noisered artifacts!
             if not exclude_artifacts or \
-               _is_good(raw_segmentsig, infosig['ch_names'], idx_by_typesig, reject, flat=None,
-                        ignore_chs=raw.info['bads']):
+               _is_good(raw_segmentsig, infosig['ch_names'], idx_by_typesig, reject,
+                        flat=None, ignore_chs=raw.info['bads']):
                 sigmean += raw_segmentsig.sum(axis=1)
-                refmean += raw_segmentref.sum(axis=1)
                 sscovdata += (raw_segmentsig * raw_segmentsig).sum(axis=1)
-                srcovdata += np.dot(raw_segmentsig, raw_segmentref.T)
-                rrcovdata += np.dot(raw_segmentref, raw_segmentref.T)
                 n_samples += raw_segmentsig.shape[1]
-            else:
-                logger.info("Artefact detected in [%d, %d]" % (first, last))
-        if n_samples <= 1:
-            raise ValueError('Too few samples to calculate weights')
         sigmean /= n_samples
-        refmean /= n_samples
         sscovdata -= n_samples * sigmean[:] * sigmean[:]
         sscovdata /= (n_samples - 1)
-        srcovdata -= n_samples * sigmean[:, None] * refmean[None, :]
-        srcovdata /= (n_samples - 1)
-        rrcovdata -= n_samples * refmean[:, None] * refmean[None, :]
-        rrcovdata /= (n_samples - 1)
-        sscovinit = np.copy(sscovdata)
+        
         if verbose:
-            print ">>> Normalize srcov..."
-
-        rrslope = copy.copy(rrcovdata)
-        for iref in xrange(nref):
-            dtmp = rrcovdata[iref, iref]
-            if dtmp > TINY:
-                srcovdata[:, iref] /= dtmp
-                rrslope[:, iref] /= dtmp
-            else:
-                srcovdata[:, iref] = 0.
-                rrslope[:, iref] = 0.
-
-        if verbose:
-            print ">>> Number of samples used : %d" % n_samples
+            print ">>> no channel got worse: ", np.all(np.less_equal(sscovdata, sscovinit))
+            print ">>> final rt(avg sig pwr) = %12.5e" % np.sqrt(np.mean(sscovdata))
+            for i in xrange(5):
+                print ">>> final signal-rms[%3d] = %12.5e" % (i, np.sqrt(sscovdata.flatten()[i]))
             tc1 = time.clock()
             tw1 = time.time()
-            print ">>> sigrefchn covar-calc took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
+            print ">>> signal covar-calc took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
+            print ">>>"
 
-        if checkresults:
-            if verbose:
-                print "########## Calculated initial signal channel covariance:"
-                # Calculate initial signal channel covariance:
-                # (only used as quality measure)
-                print ">>> initl rt(avg sig pwr) = %12.5e" % np.sqrt(np.mean(sscovdata))
-                for i in xrange(5):
-                    print ">>> initl signal-rms[%3d] = %12.5e" % (i, np.sqrt(sscovdata.flatten()[i]))
-                print ">>>"
-
-        U, s, V = np.linalg.svd(rrslope, full_matrices=True)
-        if verbose:
-            print ">>> singular values:"
-            print s
-            print ">>> Applying cutoff for smallest SVs:"
-
-        dtmp = s.max() * SVD_RELCUTOFF
-        s *= (abs(s) >= dtmp)
-        sinv = [1. / s[k] if s[k] != 0. else 0. for k in xrange(nref)]
-        if verbose:
-            print ">>> singular values (after cutoff):"
-            print s
-
-        stat = np.allclose(rrslope, np.dot(U, np.dot(np.diag(s), V)))
-        if verbose:
-            print ">>> Testing svd-result: %s" % stat
-            if not stat:
-                print "    (Maybe due to SV-cutoff?)"
-
-        # Solve for inverse coefficients:
-        # Set RRinv.tr=U diag(sinv) V
-        RRinv = np.transpose(np.dot(U, np.dot(np.diag(sinv), V)))
-        if checkresults:
-            stat = np.allclose(np.identity(nref), np.dot(RRinv, rrslope))
-            if stat:
-                if verbose:
-                    print ">>> Testing RRinv-result (should be unit-matrix): ok"
-            else:
-                print ">>> Testing RRinv-result (should be unit-matrix): failed"
-                print np.transpose(np.dot(RRinv, rrslope))
-                print ">>>"
-
-        if verbose:
-            print "########## Calc weight matrix..."
-
-        # weights-matrix will be somewhat larger than necessary,
-        # (to simplify indexing in compensation loop):
-        weights = np.zeros((raw._data.shape[0], nref))
-        for isig in xrange(nsig):
-            for iref in xrange(nref):
-                weights[sigpick[isig],iref] = np.dot(srcovdata[isig,:], RRinv[:,iref])
-
-        if verbose:
-            print "########## Compensating signal channels:"
-            if complementary_signal:
-                print ">>> Caveat: REPLACING signal by compensation signal"
-
-        tct = time.clock()
-        twt = time.time()
-
-        # Work on entire data stream:
-        for isl in xrange(raw._data.shape[1]):
-            slice = np.take(raw._data, [isl], axis=1)
-            if use_reffilter:
-                refslice = np.take(fltref._data, [isl], axis=1)
-                refarr = refslice[:].flatten() - refmean
-                # refarr = fltres[:,isl]-refmean
-            else:
-                refarr = slice[refpick].flatten() - refmean
-            subrefarr = np.dot(weights[:], refarr)
-
-            if not complementary_signal:
-                raw._data[:, isl] -= subrefarr
-            else:
-                raw._data[:, isl] = subrefarr
-
-            if (isl % 10000 == 0) and verbose:
-                print "\rProcessed slice %6d" % isl
-
-        if verbose:
-            print "\nDone."
-            tc1 = time.clock()
-            tw1 = time.time()
-            print ">>> compensation loop took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
-
-        if checkresults:
-            if verbose:
-                print "########## Calculating final signal channel covariance:"
-            # Calculate final signal channel covariance:
-            # (only used as quality measure)
-            tct = time.clock()
-            twt = time.time()
-            sigmean = 0
-            sscovdata = 0
-            n_samples = 0
-            for first in range(itmin, itmax, itstep):
-                last = first + itstep
-                if last >= itmax:
-                    last = itmax
-                raw_segmentsig, times = raw[sigpick, first:last]
-                # Artifacts found here will probably differ from pre-noisered artifacts!
-                if not exclude_artifacts or \
-                   _is_good(raw_segmentsig, infosig['ch_names'], idx_by_typesig, reject,
-                            flat=None, ignore_chs=raw.info['bads']):
-                    sigmean += raw_segmentsig.sum(axis=1)
-                    sscovdata += (raw_segmentsig * raw_segmentsig).sum(axis=1)
-                    n_samples += raw_segmentsig.shape[1]
-            sigmean /= n_samples
-            sscovdata -= n_samples * sigmean[:] * sigmean[:]
-            sscovdata /= (n_samples - 1)
-            if verbose:
-                print ">>> no channel got worse: ", np.all(np.less_equal(sscovdata, sscovinit))
-                print ">>> final rt(avg sig pwr) = %12.5e" % np.sqrt(np.mean(sscovdata))
-                for i in xrange(5):
-                    print ">>> final signal-rms[%3d] = %12.5e" % (i, np.sqrt(sscovdata.flatten()[i]))
-                tc1 = time.clock()
-                tw1 = time.time()
-                print ">>> signal covar-calc took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tct), (tw1 - twt))
-                print ">>>"
-
-        if fnout is not None:
-            fnoutloc = fnout
-        else:
-            fnoutloc = fname[:fname.rfind('-raw.fif')] + ',nr-raw.fif'
-
-        if verbose:
-            print ">>> Saving '%s'..." % fnoutloc
-
-        if return_raw:
-            return raw
-        else:
-            raw.save(fnoutloc, overwrite=True)
-
-        tc1 = time.clock()
-        tw1 = time.time()
-        if verbose:
-            print ">>> Total run took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tc0), (tw1 - tw0))
-
+   #--- fb update 21.07.2015     
+    fname_out = jumeg_base.get_fif_name(raw=raw,postfix=fif_postfix,extention=fif_extention)                       
+      
+    if save:    
+       jumeg_base.apply_save_mne_data(raw,fname=fname_out,overwrite=True)
+     
+             
+    tc1 = time.clock()
+    tw1 = time.time()
+    if verbose:
+       print ">>> Total run took %.1f ms (%.2f s walltime)" % (1000. * (tc1 - tc0), (tw1 - tw0))
+        
+    return raw,fname_out  
 
 ##################################################
 #
@@ -781,7 +764,7 @@ def test_noise_reducer():
     # Time window selection
     # weights are calc'd based on [tmin,tmax], but applied to the entire data set.
     # tstep is used in artifact detection
-    tmax = raw.times[raw.last_samp]
+    tmax = raw.index_as_time(raw.last_samp)[0]
     tstep = 0.2
     itmin = int(floor(tmin * raw.info['sfreq']))
     itmax = int(ceil(tmax * raw.info['sfreq']))

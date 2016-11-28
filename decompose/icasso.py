@@ -4,10 +4,10 @@
 ----------------------------------------------------------------------
 --- jumeg.decompose.fourier_ica --------------------------------------
 ----------------------------------------------------------------------
- autor      : Lukas Breuer
+ author     : Lukas Breuer
  email      : l.breuer@fz-juelich.de
- last update: 31.03.2015
- version    : 1.0
+ last update: 27.11.2015
+ version    : 1.1
 
 ----------------------------------------------------------------------
  This simple implementation of ICASSO is based on the following
@@ -33,7 +33,7 @@ multiple times with slightly different conditions and
 clustering the obtained components. Note, here FourierICA
 is applied
 
- 1. Runs FourierICA with given parameters M times on data X.
+ 1. Runs ICA with given parameters M times on data X.
  2. Clusters the estimates and computes other statistics.
  3. Returns (and visualizes) the best estimates.
 
@@ -67,25 +67,90 @@ import numpy as np
 ########################################################
 class JuMEG_icasso(object):
 
-    def __init__(self, nrep=50):
+    def __init__(self, ica_method='fourierica', average=False, nrep=50,
+                 fn_inv=None, src_loc_method='dSPM', snr=3.0,
+                 morph2fsaverage=True, stim_name=None, event_id=1,
+                 flow=4.0, fhigh=34.0, tmin_win=0.0, tmax_win=1.0,
+                 envelopeICA=False, pca_dim=None, conv_eps=1e-9,
+                 max_iter=2000, tICA=False, lrate=1.0, cost_function=None):
         """
         Generate ICASSO object.
 
             Parameters
             ----------
+            ica_method: string which ICA method should be used
+                default: ica_method='FourierICA'
+            average: should ICA be performed on data averaged above
+                subjects?
+                default: average=False
             nrep: number of repetitions ICA should be performed
                 default: nrep=50
+            envelopeICA: if set ICA is estimated on the envelope
+                of the Fourier transformed input data, i.e., the
+                mixing model is |x|=As
+                default: envelopeICA=False
+            fn_inv: file name of inverse operator. If given
+                FourierICA is applied on data transformed to
+                source space
+            src_loc_method: method used for source localization.
+                Only of interest if 'fn_inv' is set
+                default: src_loc_method='dSPM'
+            snr: signal-to-noise ratio for performing source
+                localization
+                default: snr=3.0
+            morph2fsaverage: should data be morphed to the
+                'fsaverage' brain?
+                default: morph2fsaverage=True
+            stim_name
 
             Returns
             -------
             object: ICASSO object
         """
 
-        self._nrep = nrep     # number of repetitions
-        self.whitenMat = []
-        self.dewhitenMat = []
-        self.W_est = []
-        self.A_est = []
+        self._ica_method = ica_method
+        self.average = average
+        self._nrep = nrep
+        self.fn_inv = fn_inv
+        self.src_loc_method = src_loc_method
+        self.snr = snr
+        self.morph2fsaverage = morph2fsaverage
+        self.whitenMat = []                     # whitening matrix
+        self.dewhitenMat = []                   # de-whitening matrix
+        self.W_est = []                         # de-mixing matrix
+        self.A_est = []                         # mixing matrix
+        self.dmean = []                         # data mean
+        self.dstd = []                          # data standard-deviation
+        self.stim_name = stim_name
+        self.event_id = event_id
+        self.flow = flow
+        self.fhigh = fhigh
+        self._sfreq = 0.0
+        self.tmin_win = tmin_win
+        self.tmax_win = tmax_win
+
+        # ICA parameter
+        self.conv_eps = conv_eps                # stopping threshold
+        self.max_iter = max_iter
+        self.lrate = lrate                      # learning rate for the ICA algorithm
+        self.tICA = tICA                        # should temporal ICA be performed?
+        self.pca_dim = pca_dim
+        self.cost_function = cost_function
+
+
+        # make sure to chose meaningful parameters
+        # when not FourierICA is used
+        if self.ica_method != 'fourierica':
+            if conv_eps == 1e-9:
+                self.conv_eps = 1e-12           # stopping threshold
+
+            if max_iter == 2000:
+                self.max_iter = 200
+
+            if lrate == 1:
+                self.lrate = None               # learning rate for the ICA algorithm
+
+
 
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -99,6 +164,27 @@ class JuMEG_icasso(object):
 
     nrep = property(_get_nrep, _set_nrep)
 
+
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # set/get ICA method
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def _set_ica_method(self, ica_method):
+        possible_methods = ['extended-infomax', 'fastica',
+                            'fourierica', 'infomax']
+        if ica_method in possible_methods:
+            self._ica_method = ica_method
+        else:
+            print 'WARNING: chosen ICA method does not exist!'
+            print 'Must be one of the following methods: ', possible_methods
+            print 'But your choice was: ', ica_method
+            print 'Programm stops!'
+            import pdb
+            pdb.set_trace()
+
+    def _get_ica_method(self):
+        return self._ica_method
+
+    ica_method = property(_get_ica_method, _set_ica_method)
 
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -203,9 +289,6 @@ class JuMEG_icasso(object):
             c_var = Z[k, 0]
             k_var = np.array([Z[k, 1]])
             idx_var = np.where(order == c_var)[0]
-
-            # import pdb
-            # pdb.set_trace()
 
             if len(idx_var) == 0:
                 order = np.concatenate((k_var, order))
@@ -709,14 +792,363 @@ class JuMEG_icasso(object):
         return A, W, Iq
 
 
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # prepare data for applying the fit routine
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def prepare_data_for_fit(self, fn_raw, stim_name=None, stim_delay=0,
+                             tmin_stim=0.0, tmax_stim=1.0, flow=4.0, fhigh=34.0,
+                             event_id=1, hamming_data=True, remove_outliers=True,
+                             fn_inv=None, contrast_id=[], baseline=(None, None),
+                             averaged_epochs=False, verbose=True):
+
+
+        # ------------------------------------------
+        # import necessary module
+        # ------------------------------------------
+        from fourier_ica import apply_stft, stft_source_localization
+        from mne import find_events, pick_types
+        from mne.io import Raw
+
+        # ------------------------------------------
+        # prepare data to apply FourierICA
+        # ------------------------------------------
+        meg_raw = Raw(fn_raw, preload=True)
+        meg_channels = pick_types(meg_raw.info, meg=True, eeg=False,
+                                  eog=False, stim=False, exclude='bads')
+        meg_data = meg_raw._data[meg_channels, :]
+        sfreq = meg_raw.info['sfreq']
+
+        # check if ICASSO should be applied
+        # to evoked or resting state data
+        if stim_name:
+            events_all = find_events(meg_raw, stim_channel=stim_name, consecutive=True,
+                                     shortest_event=1)
+
+            # check if there is a stimulus delay
+            if stim_delay:
+                stim_delay_tsl = int(np.round(stim_delay * meg_raw.info['sfreq']/1000.0))
+                events_all[:, 0] += stim_delay_tsl
+
+            if np.any(contrast_id):
+                contrast_events = events_all[events_all[:, 2] == contrast_id, 0]
+
+            if not isinstance(event_id, (list, tuple)):
+                event_id = [event_id]
+
+            for idx, event in enumerate(event_id):
+                if idx == 0:
+                    events = events_all[events_all[:, 2] == event, :]
+                else:
+                    events = np.concatenate((events, events_all[events_all[:, 2] == event, :]))
+
+            if not self.tICA:
+                events = events[:, 0]
+
+        else:
+            events = []
+
+
+        if self.tICA and not fn_inv:
+            print ">>> ERROR: For applying temporal ICA in source space the file name "
+            print "           of the inverse operator is required!"
+            import pdb
+            pdb.set_trace()
+
+
+
+        # ------------------------------------------
+        # check if ICA should be applied in source
+        # space
+        # ------------------------------------------
+        if fn_inv:
+
+            # ------------------------------------------
+            # check if temporal ICA should be applied
+            # on data transformed to source space
+            # --> note: here data are not transformed
+            #           to Fourier space
+            # ------------------------------------------
+            if self.tICA:
+
+                # -------------------------------------------
+                # check if all necessary parameters are set
+                # -------------------------------------------
+                if not stim_name:
+                    print ">>> ERROR: For applying temporal ICA in source space a stimulus name is required!"
+                    import pdb
+                    pdb.set_trace()
+
+
+                # -------------------------------------------
+                # generate epochs around stimulus onset
+                # -------------------------------------------
+                from mne import Epochs
+                epoch_data = Epochs(meg_raw, events, event_id,
+                                    tmin_stim, tmax_stim,
+                                    picks=meg_channels, baseline=baseline,
+                                    proj=False, verbose=False)
+
+                if averaged_epochs:
+                    X = epoch_data.average().data.transpose()
+                    X = X.reshape([X.shape[0], 1, X.shape[1]])
+                else:
+                    X = epoch_data.get_data().transpose([2, 0, 1])
+
+
+            # ------------------------------------------
+            # FourierICA is applied on data transformed
+            # to source space
+            # ------------------------------------------
+            else:
+                # -------------------------------------------
+                # transform data to STFT
+                # -------------------------------------------
+                # print out some information
+                if verbose:
+                     print ">>> transform data to Fourier space..."
+
+                win_length_sec = tmax_stim - tmin_stim
+                X, _ = apply_stft(meg_data, events=events, tpre=tmin_stim,
+                                  sfreq=sfreq, flow=flow, fhigh=fhigh,
+                                  win_length_sec=win_length_sec,
+                                  hamming_data=hamming_data,
+                                  remove_outliers=remove_outliers,
+                                  baseline=baseline, verbose=verbose)
+
+                if np.any(contrast_id):
+                    X_contrast, _ = apply_stft(meg_data, events=contrast_events,
+                                               tpre=tmin_stim, sfreq=sfreq,
+                                               flow=flow, fhigh=fhigh,
+                                               win_length_sec=win_length_sec,
+                                               hamming_data=hamming_data,
+                                               remove_outliers=remove_outliers,
+                                               baseline=baseline,
+                                               verbose=verbose)
+
+
+            # -------------------------------------------
+            # perform source localization
+            # -------------------------------------------
+            # print out some information
+            if verbose:
+                 print ">>> estimate inverse solution..."
+
+            src_loc_data, vertno = stft_source_localization(X, fn_inv,
+                                                            method=self.src_loc_method,
+                                                            morph2fsaverage=self.morph2fsaverage,
+                                                            snr=self.snr)
+
+            if np.any(contrast_id):
+                src_loc_data_contrast, _ = stft_source_localization(X_contrast, fn_inv,
+                                                                    method=self.src_loc_method,
+                                                                    morph2fsaverage=self.morph2fsaverage,
+                                                                    snr=self.snr)
+                del _
+                n_epochs = np.min([src_loc_data.shape[1], src_loc_data_contrast.shape[1]])
+                events = events[:n_epochs]
+                src_loc_data = src_loc_data[:, :n_epochs, :] - src_loc_data_contrast[:, :n_epochs, :]
+                
+
+            data_already_stft = True
+            meg_data = X
+
+
+        # ------------------------------------------
+        # FourierICA would be applied on
+        # data in the sensor space
+        # ------------------------------------------
+        else:
+            data_already_stft = False
+            vertno = None
+            src_loc_data = None
+
+
+        return meg_data, src_loc_data, vertno, data_already_stft, events, sfreq, meg_channels
+
+
+
+
+
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # perform ICASSO based FourierICA signal decomposition
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def fit_tICA(self, ica_data, verbose=True):
+
+        # ------------------------------------------
+        # import necessary module
+        # ------------------------------------------
+        from ica import ica_array
+        from scipy.linalg import pinv
+
+
+        # ------------------------------------------
+        # print out some information
+        # ------------------------------------------
+        if verbose:
+            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+            print ">>>      Performing %s estimation" % self.ica_method
+            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+
+
+        # ------------------------------------------
+        # initialize some data
+        # ------------------------------------------
+        pca = None
+
+
+        # ------------------------------------------
+        # perform ICASSO ICA
+        # ------------------------------------------
+        for irep in range(self.nrep):
+            weights, pca, activations = ica_array(ica_data,
+                                                  overwrite=None, pca=pca,
+                                                  max_pca_components=self.pca_dim,
+                                                  method=self.ica_method,
+                                                  cost_func=self.cost_function,
+                                                  weights=None, lrate=self.lrate,
+                                                  wchange=self.conv_eps,
+                                                  maxsteps=self.max_iter,
+                                                  verbose=verbose)
+
+
+            if irep == 0:
+                self.whitenMat = pca.components_
+                self.dewhitenMat = pinv(pca.components_)
+                self.dmean = pca.mean_
+                self.dstd = pca.stddev_
+
+            # save results in structure
+            W_orig = np.dot(weights, self.whitenMat)
+            A_orig = np.dot(self.dewhitenMat, pinv(weights))
+            self.W_est.append(W_orig)
+            self.A_est.append(A_orig)
+
+            # print out some information
+            if verbose and self.nrep > 1:
+                print ">>> Running %s number %d of %d done" % (self.ica_method, irep+1, self.nrep)
+
+                if irep == 0:
+                    print "..... %s parameter:" % self.ica_method
+                    print "....."
+                    print "..... Stopping threshold: %d" % self.conv_eps
+                    print "..... Maximal number of iterations: %d" % self.max_iter
+                    print "..... Learning rate: %d" % self.lrate
+                    print "..... Number of independent components: %d" % self.pca_dim
+                    print "....."
+
+
+
+
+
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # perform ICASSO based FourierICA signal decomposit ion
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def fit_FourierICA(self, ica_data, events, sfreq,
+                       complex_mixing=True, hamming_data=False,
+                       remove_outliers=False, envelopeICA=False,
+                       contrast_id=[], normalized=True,
+                       data_already_stft=False, verbose=True):
+
+
+        # ------------------------------------------
+        # import necessary module
+        # ------------------------------------------
+        from fourier_ica import JuMEG_fourier_ica
+
+
+        # ------------------------------------------
+        # generate FourierICA object
+        # ------------------------------------------
+        if verbose:
+            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+            print ">>>      Performing FourierICA estimation"
+            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+
+        win_length_sec = self.tmax_win - self.tmin_win
+        fourier_ica_obj = JuMEG_fourier_ica(events=events, tpre=self.tmin_win,
+                                            flow=self.flow, fhigh=self.fhigh,
+                                            sfreq=sfreq,
+                                            win_length_sec=win_length_sec,
+                                            remove_outliers=remove_outliers,
+                                            hamming_data=hamming_data,
+                                            complex_mixing=complex_mixing,
+                                            pca_dim=self.pca_dim,
+                                            max_iter=self.max_iter,
+                                            conv_eps=self.conv_eps,
+                                            cost_function=self.cost_function,
+                                            envelopeICA=envelopeICA,
+                                            lrate=self.lrate)
+
+
+        # ------------------------------------------
+        # initialize some data
+        # ------------------------------------------
+        whitenMat = []
+        dewhitenMat = []
+
+
+        # ------------------------------------------
+        # perform ICASSO ICA
+        # ------------------------------------------
+        for irep in range(self.nrep):
+
+            # apply FourierICA
+            if self.nrep == 1:
+                verbose_fourierICA = verbose
+            else:
+                verbose_fourierICA = False
+
+
+            W_orig, A_orig, S_FT, Smean, Sstddev, objective, whitenMat, \
+            dewhitenMat = fourier_ica_obj.fit(ica_data, whiten_mat=whitenMat,
+                                              dewhiten_mat=dewhitenMat,
+                                              data_already_stft=data_already_stft,
+                                              data_already_normalized=normalized,
+                                              verbose=verbose_fourierICA)
+
+
+            if irep == 0:
+                self.whitenMat = whitenMat
+                self.dewhitenMat = dewhitenMat
+                self.dmean = Smean
+                self.dstd = Sstddev
+
+            # save results in structure
+            self.W_est.append(W_orig)
+            self.A_est.append(A_orig)
+
+            # print out some information
+            if verbose and self.nrep > 1:
+                print ">>> Running FourierICA number %d of %d done" % (irep+1, self.nrep)
+
+                if irep == 0:
+                    str_hamming_window = "True" if fourier_ica_obj.hamming_data else "False"
+                    str_complex_mixing = "True" if fourier_ica_obj.complex_mixing else "False"
+                    print "..... Fourier ICA parameter:"
+                    print "....."
+                    print "..... Sampling frequency set to: %d" % fourier_ica_obj.sfreq
+                    print "..... Start of frequency band set to: %d" % fourier_ica_obj.flow
+                    print "..... End of frequency band set to: %d" % fourier_ica_obj.fhigh
+                    print "..... Using hamming window: %s" % str_hamming_window
+                    print "..... Assume complex mixing: %s" % str_complex_mixing
+                    print "..... Number of independent components: %d" % fourier_ica_obj.ica_dim
+                    print "....."
+
+        return fourier_ica_obj
+
+
+
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
     # perform ICASSO based ICA signal decomposition
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    def fit(self, fn_raw, stim_name=None, event_id=1,
-            tmin_stim=0.0, tmax_stim=1.0, flow=4.0, fhigh=34.0,
-            pca_dim=0.90, max_iter=10000, conv_eps=1e-16,
-            verbose=True):
+    def fit(self, fn_raw, ica_method=None, average=False, stim_name=None,
+            event_id=None, stim_delay=0, tmin_win=None,
+            tmax_win=None, flow=None, fhigh=None, pca_dim=None,
+            max_iter=None, conv_eps=None, complex_mixing=True,
+            hamming_data=False, remove_outliers=False,
+            envelopeICA=False, fn_inv=None, cost_function=None,
+            contrast_id=[], baseline=(None, None), verbose=True):
 
         """
         Perform ICASSO estimation. ICASSO is based on running ICA
@@ -728,6 +1160,10 @@ class JuMEG_icasso(object):
             Parameters
             ----------
             fn_raw: filename of the input data (expect fif-file).
+            average: Should data be averaged across subjects before
+                FourierICA application? Note, averaged data require
+                less memory!
+                default: average=False
             stim_name: name of the stimulus channel. Note, for
                 applying FourierCIA data are chopped around stimulus
                 onset. If not set data are chopped in overlapping
@@ -737,10 +1173,12 @@ class JuMEG_icasso(object):
                 the stimulus channel. Only of interest if 'stim_name'
                 is set
                 default: event_id=1
-            tmin_stim: time of interest prior to stimulus onset.
+            stim_delay: delay of stimulus presentation in milliseconds
+                default: stim_delay=0
+            tmin_win: time of interest prior to stimulus onset.
                 Important for generating epochs to apply FourierICA
                 default = 0.0
-            tmax_stim: time of interest after stimulus onset.
+            tmax_win: time of interest after stimulus onset.
                 Important for generating epochs to apply FourierICA
                 default = 1.0
             flow: lower frequency border for estimating the optimal
@@ -784,94 +1222,255 @@ class JuMEG_icasso(object):
         # ------------------------------------------
         # import necessary module
         # ------------------------------------------
-        from fourier_ica import JuMEG_fourier_ica
-        from mne import find_events, pick_types, set_log_level
-        from mne.io import Raw
-
+        from mne import set_log_level
 
         # set log level to 'WARNING'
         set_log_level('WARNING')
 
         # ------------------------------------------
-        # prepare data to apply FourierICA
+        # check input parameter
         # ------------------------------------------
-        meg_raw = Raw(fn_raw, preload=True)
-        meg_channels = pick_types(meg_raw.info, meg=True, eeg=False,
-                                  eog=False, stim=False, exclude='bads')
-        meg_data = meg_raw._data[meg_channels, :]
+        if ica_method:
+            self.ica_method = ica_method
+
+        if average:
+            self.average = average
+
+        if fn_inv:
+            self.fn_inv = fn_inv
+
+        if cost_function:
+            self.cost_function = cost_function
+
+        if pca_dim:
+            self.pca_dim = pca_dim
 
         if stim_name:
-            events = find_events(meg_raw, stim_channel=stim_name, consecutive=True)
-            events = events[events[:, 2] == event_id, 0]
+            self.stim_name = stim_name
+
+        if event_id:
+            self.event_id = event_id
+
+        if tmin_win:
+            self.tmin_win = tmin_win
+
+        if tmax_win:
+            self.tmax_win = tmax_win
+
+        if flow:
+            self.flow = flow
+
+        if fhigh:
+            self.fhigh = fhigh
+
+        if max_iter:
+            self.max_iter = max_iter
+
+        if conv_eps:
+            self.conv_eps = conv_eps
+
+
+        # ------------------------------------------
+        # check which ICA algorithm should be
+        # applied
+        # ------------------------------------------
+        if self.ica_method in  ['extended-infomax', 'fastica', 'infomax']:
+            self.tICA = True
+
+            if not self.cost_function in ['logcosh', 'exp', 'cube']:
+                self.cost_function = 'logcosh'
+
+        elif self.ica_method == 'fourierica':
+            self.tICA = False
         else:
-            events = []
+            print 'WARNING: chosen ICA method does not exist!'
+            print 'Programm stops!'
+            import pdb
+            pdb.set_trace()
+
+
+
+       # ------------------------------------------
+        # prepare data to apply ICASSO
+        # ------------------------------------------
+        # check if fn_raw is a list, i.e., group FourierICA
+        # should be applied
+        if isinstance(fn_raw, list):
+
+            # test if FourierICA should be applied
+            if self.ica_method != 'fourierica':
+                print ">>> NOTE: When using temporal group ICA it is recommended " \
+                      "to use ICA based on averaged datasets"
+                print ">>> Parameters are set for group ICA!"
+                average_epochs = True
+                self.average = False
+            else:
+                average_epochs = False
+
+
+            # loop over all files
+            for idx, fnraw in enumerate(fn_raw):
+                meg_data_cur, src_loc, vert, data_already_stft, events, sfreq, picks = \
+                    self.prepare_data_for_fit(fnraw, stim_name=self.stim_name,
+                                              tmin_stim=self.tmin_win, tmax_stim=self.tmax_win,
+                                              flow=self.flow, fhigh=self.fhigh, event_id=self.event_id,
+                                              stim_delay=stim_delay, hamming_data=hamming_data,
+                                              fn_inv=self.fn_inv[idx], remove_outliers=remove_outliers,
+                                              contrast_id=contrast_id, baseline=baseline,
+                                              averaged_epochs=average_epochs, verbose=verbose)
+
+                # normalize source data
+                fftsize, nwindows, nvoxel = src_loc.shape
+                nrows_Xmat_c = fftsize*nwindows
+                src_loc = src_loc.reshape((nrows_Xmat_c, nvoxel), order='F')
+                dmean = np.mean(src_loc, axis=0)
+                dstddev = np.std(src_loc, axis=0)
+
+
+                # ---------------------------------
+                # save all data in one matrix
+                # ---------------------------------
+                if self.average:
+
+                    if self.ica_method == 'fourierica':
+                        if idx == 0:
+                            nfn_raw = len(fn_raw)
+                            src_loc_data = np.zeros((nrows_Xmat_c, nvoxel), dtype=np.complex)
+                            meg_data = np.zeros((fftsize, nwindows, 248), dtype=np.complex)
+                            nwindows_min = nwindows
+
+                        # check if result arrays must be reduced
+                        if nwindows_min > nwindows:
+                            nwindows_min = nwindows
+                            src_loc_data = src_loc_data[:(nwindows_min*fftsize), :]
+                            meg_data = meg_data[:, :nwindows_min, :]
+
+                        src_loc_data += (src_loc[:(nwindows_min*fftsize), :] - dmean[np.newaxis, :]) / \
+                                        (dstddev[np.newaxis, :]*nfn_raw)
+                        meg_data[:, :, picks] += (meg_data_cur[:, :nwindows_min, :]/nfn_raw)
+                else:
+                    if idx == 0:
+                        nfn_raw = len(fn_raw)
+                        src_loc_data = np.zeros((nfn_raw*nrows_Xmat_c, nvoxel), dtype=np.complex)
+                        meg_data = np.zeros((fftsize, nfn_raw*nwindows, 248), dtype=np.complex)
+
+                    src_loc_data[(idx*nrows_Xmat_c):((idx+1)*nrows_Xmat_c), :] = \
+                        (src_loc - dmean[np.newaxis, :]) / dstddev[np.newaxis, :]
+                    meg_data[:, (idx*nwindows):((idx+1)*nwindows), picks] = meg_data_cur
+
+
+                # ---------------------------------
+                # free some me
+                # ---------------------------------
+                del meg_data_cur, src_loc, dmean, dstddev
+
+
+
+            normalized = True
+
+        else:
+            meg_data, src_loc_data, vertno, data_already_stft, events, sfreq, picks = \
+                self.prepare_data_for_fit(fn_raw, stim_name=self.stim_name,
+                                          tmin_stim=self.tmin_win, tmax_stim=self.tmax_win,
+                                          flow=self.flow, fhigh=self.fhigh, event_id=self.event_id,
+                                          stim_delay=stim_delay, hamming_data=hamming_data,
+                                          fn_inv=self.fn_inv, remove_outliers=remove_outliers,
+                                          baseline=baseline, verbose=verbose)
+            normalized = False
+
+        self._sfreq = sfreq
+        # ------------------------------------------
+        # check if PCA dimension is set...if not
+        # use MIBS to estimate the dimension
+        # ------------------------------------------
+        if not self.pca_dim:
+
+            # import some modules
+            from .complex_ica import cov
+            from scipy.linalg import eigh
+            from .dimension_selection import aic_mdl
+
+            # concatenate STFT for consecutive windows in each channel
+            fftsize, nwindows, nchan = meg_data.shape
+            nrows_Xmat_c = fftsize*nwindows
+            Xmat_c = meg_data.reshape((nrows_Xmat_c, nchan), order='F')
+
+            covmat = cov(Xmat_c, rowvar=0)
+            Dc, Ec = eigh(covmat.real)
+            idx_sort = np.argsort(Dc.real)[::-1]
+            Dc = Dc[idx_sort].real
+            ntsl = Xmat_c.shape[0]
+            _, pca_dim = aic_mdl(Dc)
+
+
+            if pca_dim > 60:
+                print "WARNING: You have %d PCA components!" % (pca_dim)
+                print "Using now explained variance..."
+                explVar = np.abs(Dc.copy())
+                explVar /= explVar.sum()
+                pca_dim = np.sum(explVar.cumsum() <= 0.9) + 1
+                print "Dimension is now: %d components!" % (pca_dim)
+
+            self.pca_dim = pca_dim
+            del Xmat_c, covmat, Ec, idx_sort, Dc, ntsl, _
 
 
         # ------------------------------------------
-        # generate FourierICA object
+        # check if ICA should be applied in sensor
+        # or source space
         # ------------------------------------------
-        if verbose:
-            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
-            print ">>>      Performing FourierICA estimation      <<<"
-            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
-
-        win_length_sec = tmax_stim - tmin_stim
-        fourier_ica_obj = JuMEG_fourier_ica(events=events, tpre=tmin_stim,
-                                            flow=flow, fhigh=fhigh,
-                                            win_length_sec=win_length_sec,
-                                            remove_outliers=True,
-                                            hamming_data=True,
-                                            complex_mixing=True,
-                                            pca_dim=pca_dim,
-                                            max_iter=max_iter,
-                                            conv_eps=conv_eps)
+        if self.fn_inv:
+            ica_data = src_loc_data
+        else:
+            ica_data = meg_data.copy()
 
 
         # ------------------------------------------
-        # perform ICASSO ICA
+        # check which ICA algorithm should be
+        # applied
         # ------------------------------------------
-        for irep in range(self.nrep):
-            # apply FourierICA
-            W_orig, A_orig, _, _, _, whitenMat, dewhitenMat = fourier_ica_obj.fit(meg_data.copy(), verbose=False)
+        if self.ica_method in ['extended-infomax', 'fastica', 'infomax']:
+            self.fit_tICA(ica_data.real.T, verbose=verbose)
+            fourier_ica_obj = None
 
-            if irep == 0:
-                self.whitenMat = whitenMat
-                self.dewhitenMat = dewhitenMat
-
-            # save results in structure
-            self.W_est.append(W_orig)
-            self.A_est.append(A_orig)
-
-            # print out some information
-            if verbose:
-                print ">>> Running FourierICA number %d of %d done" % (irep+1, self.nrep)
-
-                if irep == 0:
-                    str_hamming_window = "True" if fourier_ica_obj.hamming_data else "False"
-                    str_complex_mixing = "True" if fourier_ica_obj.complex_mixing else "False"
-                    print "..... Fourier ICA parameter:"
-                    print "....."
-                    print "..... Sampling frequency set to: %d" % fourier_ica_obj.sfreq
-                    print "..... Start of frequency band set to: %d" % fourier_ica_obj.flow
-                    print "..... End of frequency band set to: %d" % fourier_ica_obj.fhigh
-                    print "..... Using hamming window: %s" % str_hamming_window
-                    print "..... Assume complex mixing: %s" % str_complex_mixing
-                    print "..... Number of independent components: %d" % fourier_ica_obj.ica_dim
-                    print "....."
+        elif self.ica_method == 'fourierica':
+            fourier_ica_obj = self.fit_FourierICA(ica_data, events, sfreq,
+                                                  complex_mixing=complex_mixing,
+                                                  hamming_data=hamming_data,
+                                                  remove_outliers=remove_outliers,
+                                                  envelopeICA=envelopeICA,
+                                                  contrast_id=contrast_id,
+                                                  normalized=normalized,
+                                                  data_already_stft=data_already_stft,
+                                                  verbose=verbose)
+        else:
+            print 'WARNING: chosen ICA method does not exist!'
+            print 'Programm stops!'
+            import pdb
+            pdb.set_trace()
 
 
         # ------------------------------------------
         # perform cluster analysis
         # ------------------------------------------
-        if verbose:
-            print ">>>"""
-            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
-            print ">>>        Performing cluster analysis         <<<"
-            print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+        if self.nrep == 1:
+            if verbose:
+                print ">>>"
+                print ">>> No clustering required as only one ICASSO repetition was performed..."
 
-        Z, order, partitions, indexR, dis, sim = self.cluster()
-        proj = self.projection(dis)
-        A, W, Iq = self.get_results(partitions, sim)
+            W = self.W_est[0]
+            A = self.A_est[0]
+            Iq = np.zeros(W.shape[0])
+        else:
+            if verbose:
+                print ">>>"
+                print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+                print ">>>        Performing cluster analysis         <<<"
+                print ">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+
+            Z, order, partitions, indexR, dis, sim = self.cluster()
+            proj = self.projection(dis)
+            A, W, Iq = self.get_results(partitions, sim)
 
 
         # ------------------------------------------
