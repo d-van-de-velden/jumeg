@@ -4,6 +4,7 @@ Utilities module for jumeg
 
 # Authors: Jurgen Dammers (j.dammers@fz-juelich.de)
 #          Praveen Sripad (pravsripad@gmail.com)
+#          Eberhard Eich (e.eich@fz-juelich.de) ()
 #
 # License: BSD (3-clause)
 
@@ -164,6 +165,25 @@ def rescale_artifact_to_signal(signal, artifact):
     return rescaled_artifact / 1e15
 
 
+def check_read_raw(raw_name, preload=True):
+    '''
+    Checks if raw_name provided is a filename of raw object.
+    If it is a raw object, simply return, else read and return raw object.
+
+    raw_name: instance of mne.io.Raw | str
+        Raw object or filename to be read.
+    preload: bool
+        All data loaded to memory. Defaults to True.
+    '''
+    if isinstance(raw_name, mne.io.Raw):
+        return raw_name
+    elif isinstance(raw_name, str):
+        raw = mne.io.Raw(raw_name, preload=preload)
+        return raw
+    else:
+        raise RuntimeError('%s type not mne.io.Raw or string.' % raw_name)
+
+
 def peak_counter(signal):
     ''' Simple peak counter using scipy argrelmax function. '''
     return sci.signal.argrelmax(signal)[0].shape
@@ -174,7 +194,7 @@ def update_description(raw, comment):
     raw.info['description'] = str(raw.info['description']) + ' ; ' + comment
 
 
-def chop_raw_data(raw, start_time=60.0, stop_time=360.0, save=True):
+def chop_raw_data(raw, start_time=60.0, stop_time=360.0, save=True, return_chop=False):
     '''
     This function extracts specified duration of raw data
     and writes it into a fif file.
@@ -186,7 +206,8 @@ def chop_raw_data(raw, start_time=60.0, stop_time=360.0, save=True):
     raw: Raw object or raw file name as a string.
     start_time: Time to extract data from in seconds. Default is 60.0 seconds.
     stop_time: Time up to which data is to be extracted. Default is 360.0 seconds.
-    save: bool, If True the raw file is written to disk.
+    save: bool, If True the raw file is written to disk. (default: True)
+    return_chop: bool, Return the chopped raw object. (default: False)
 
     '''
     if isinstance(raw, str):
@@ -198,16 +219,16 @@ def chop_raw_data(raw, start_time=60.0, stop_time=360.0, save=True):
         return
     # Obtain indexes for start and stop times.
     assert start_time < stop_time, "Start time is greater than stop time."
-    start_idx = raw.time_as_index(start_time)
-    stop_idx = raw.time_as_index(stop_time)
-    data, times = raw[:, start_idx:stop_idx]
-    raw._data,raw._times = data, times
+    crop = raw.copy().crop(tmin=start_time, tmax=stop_time)
     dur = int((stop_time - start_time) / 60)
     if save:
-        #raw.save(raw.info['filename'].split('/')[-1].split('.')[0] + '_' + str(dur) + 'm-raw.fif')
-        raw.save(raw.info['filename'].split('-raw.fif')[0] + ',' + str(dur) + 'm-raw.fif')
+        crop.save(crop.info['filename'].split('-raw.fif')[0] + ',' + str(dur) + 'm-raw.fif')
     raw.close()
-    return
+    if return_chop:
+         return crop
+    else:
+        crop.close()
+        return
 
 
 ##################################################
@@ -1291,3 +1312,262 @@ def apply_percentile_threshold(in_data, percentile):
     ''' Return ndarray with all values below percentile set to 0. '''
     in_data[in_data <= np.percentile(in_data, percentile)] = 0.
     return in_data
+
+
+
+def channel_indices_from_list(fulllist, findlist, excllist=None):
+    """Get indices of matching channel names from list
+
+    Parameters
+    ----------
+    fulllist: list of channel names
+    findlist: list of (regexp) names to find
+              regexp are resolved using mne.pick_channels_regexp()
+    excllist: list of channel names to exclude,
+              e.g., raw.info.get('bads')
+    Returns
+    -------
+    chnpick: array with indices
+    """
+    chnpick = []
+    for ir in xrange(len(findlist)):
+        if findlist[ir].translate(None, ' ').isalnum():
+            try:
+                chnpicktmp = ([fulllist.index(findlist[ir])])
+                chnpick = np.array(np.concatenate((chnpick, chnpicktmp), axis=0),
+                                   dtype=int)
+            except:
+                print ">>>>> Channel '%s' not found." % findlist[ir]
+        else:
+            chnpicktmp = (mne.pick_channels_regexp(fulllist, findlist[ir]))
+            if len(chnpicktmp) == 0:
+                print ">>>>> '%s' does not match any channel name." % findlist[ir]
+            else:
+                chnpick = np.array(np.concatenate((chnpick, chnpicktmp), axis=0),
+                                   dtype=int)
+    if len(chnpick) > 1:
+        # Remove duplicates
+        chnpick = np.sort(np.array(list(set(np.sort(chnpick)))))
+
+    if excllist is not None and len(excllist) > 0:
+        exclinds = [fulllist.index(excllist[ie]) for ie in xrange(len(excllist))]
+        chnpick = list(np.setdiff1d(chnpick, exclinds))
+    return chnpick
+
+
+def time_shuffle_slices(fname_raw, shufflechans=None, tmin=None, tmax=None):
+    """Permute time slices for specified channels.
+
+    Parameters
+    ----------
+    fname_raw : (list of) rawfile names
+    shufflechans : list of string
+              List of channels to shuffle.
+              If empty use the meg, ref_meg, and eeg channels.
+              shufflechans may contain regexp, which are resolved
+              using mne.pick_channels_regexp().
+              All other channels are copied.
+    tmin : lower latency bound for shuffle region [start of trace]
+    tmax : upper latency bound for shuffle region [ end  of trace]
+           Slice shuffling can be restricted to one region in the file,
+           the remaining parts will contain plain copies.
+
+    Outputfile
+    ----------
+    <wawa>,tperm-raw.fif for input <wawa>-raw.fif
+
+    Returns
+    -------
+    TBD
+
+    Bugs
+    ----
+    - it's the user's responsibility to keep track of shuffled chans
+    - needs to load the entire data set for operation
+
+    TODO
+    ----
+    Return raw object and indices of time shuffled channels.
+    """
+    from math import floor, ceil
+    from mne.io.pick import pick_types, channel_indices_by_type
+
+    fnraw = get_files_from_list(fname_raw)
+
+    # loop across all filenames
+    for fname in fnraw:
+        if not op.isfile(fname):
+            print 'Exiting. File not present ', fname
+            sys.exit()
+        raw = mne.io.Raw(fname, preload=True)
+        # time window selection
+        # slices are shuffled in [tmin,tmax], but the entire data set gets copied.
+        if tmin is None:
+            tmin = 0.
+        if tmax is None:
+            tmax = (raw.last_samp - raw.first_samp) / raw.info['sfreq']
+        itmin = int(floor(tmin * raw.info['sfreq']))
+        itmax = int(ceil(tmax * raw.info['sfreq']))
+        if itmax-itmin < 1:
+            raise ValueError("Time-window for slice shuffling empty/too short")
+        print ">>> Set time-range to [%7.3f, %7.3f]" % (tmin, tmax)
+
+        if shufflechans is None or len(shufflechans) == 0:
+            shflpick = mne.pick_types(raw.info, meg=True, ref_meg=True,
+                                      eeg=True, eog=False, stim=False)
+        else:
+            shflpick = channel_indices_from_list(raw.info['ch_names'][:],
+                                                 shufflechans)
+
+        nshfl = len(shflpick)
+        if nshfl == 0:
+            raise ValueError("No channel selected for slice shuffling")
+
+        totbytype = ''
+        shflbytype = ''
+        channel_indices_by_type = mne.io.pick.channel_indices_by_type(raw.info)
+        for k in channel_indices_by_type.keys():
+            tot4key = len(channel_indices_by_type[k][:])
+            if tot4key>0:
+                totbytype = totbytype + "%s:" % k + \
+                            "%c%dd " % ('%', int(ceil(np.log10(tot4key+1)))) % tot4key
+                shflbytype = shflbytype + "%s:" % k + \
+                    "%c%dd " % ('%', int(ceil(np.log10(tot4key+1)))) % \
+                    len(np.intersect1d(shflpick, channel_indices_by_type[k][:]))
+        print ">>> %3d channels in file:  %s" % (len(raw.info['chs']), totbytype)
+        print ">>> %3d channels shuffled: %s" % (len(shflpick), shflbytype)
+
+        print "Calc shuffle-array..."
+        numslice = raw._data.shape[1]
+        lselbuf = np.arange(numslice)
+        lselbuf[itmin:itmax] = itmin + np.random.permutation(itmax-itmin)
+
+        print "Shuffling slices for selected channels:"
+        data, times = raw[:, 0:numslice]
+        # work on entire data stream
+        for isl in xrange(raw._data.shape[1]):
+            slice = np.take(raw._data, [lselbuf[isl]], axis=1)
+            data[shflpick, isl] = slice[shflpick].flatten()
+        # copy data to raw._data
+        for isl in xrange(raw._data.shape[1]):
+            raw._data[:, isl] = data[:, isl]
+
+        shflname = os.path.join(os.path.dirname(fname),
+                                os.path.basename(fname).split('-')[0]) + ',tperm-raw.fif'
+        print "Saving '%s'..." % shflname
+        raw.save(shflname, overwrite=True)
+    return
+
+
+def rescale_data(data, times, baseline, mode='mean', copy=True, verbose=None):
+    """Rescale aka baseline correct data.
+
+    Parameters
+    ----------
+    data : array
+        It can be of any shape. The only constraint is that the last
+        dimension should be time.
+    times : 1D array
+        Time instants is seconds.
+    baseline : tuple or list of length 2, ndarray or None
+        The time interval to apply rescaling / baseline correction.
+        If None do not apply it. If baseline is ``(bmin, bmax)``
+        the interval is between ``bmin`` (s) and ``bmax`` (s).
+        If ``bmin is None`` the beginning of the data is used
+        and if ``bmax is None`` then ``bmax`` is set to the end of the
+        interval. If baseline is ``(None, None)`` the entire time
+        interval is used.
+        If baseline is an array, then the given array will
+        be used for computing the baseline correction i.e. the mean will be
+        computed from the array provided. The array has to be the same length
+        as the time dimension of the data. (Use case: if different prestim baseline
+        needs to be applied on evoked signals around the response)
+        If baseline is None, no correction is applied.
+    mode : None | 'ratio' | 'zscore' | 'mean' | 'percent' | 'logratio' | 'zlogratio' # noqa
+        Do baseline correction with ratio (power is divided by mean
+        power during baseline) or zscore (power is divided by standard
+        deviation of power during baseline after subtracting the mean,
+        power = [power - mean(power_baseline)] / std(power_baseline)), mean
+        simply subtracts the mean power, percent is the same as applying ratio
+        then mean, logratio is the same as mean but then rendered in log-scale,
+        zlogratio is the same as zscore but data is rendered in log-scale
+        first.
+        If None no baseline correction is applied.
+    copy : bool
+        Whether to return a new instance or modify in place.
+    verbose : bool, str, int, or None
+        If not None, override default verbose level (see mne.verbose).
+
+    Returns
+    -------
+    data_scaled: array
+        Array of same shape as data after rescaling.
+
+    Note
+    ----
+    Function taken from mne.baseline.rescale in mne-python.
+    (https://github.com/mne-tools/mne-python)
+    """
+    data = data.copy() if copy else data
+
+    from mne.baseline import _log_rescale
+    _log_rescale(baseline, mode)
+
+    if baseline is None:
+        return data
+
+    if isinstance(baseline, np.ndarray):
+        if times.size == baseline.size:
+            # use baseline array as data
+            use_array = baseline
+        else:
+            raise ValueError('Size of times and baseline should be the same')
+    else:
+        bmin, bmax = baseline
+        if bmin is None:
+            imin = 0
+        else:
+            imin = np.where(times >= bmin)[0]
+            if len(imin) == 0:
+                raise ValueError('bmin is too large (%s), it exceeds the largest '
+                                 'time value' % (bmin,))
+            imin = int(imin[0])
+        if bmax is None:
+            imax = len(times)
+        else:
+            imax = np.where(times <= bmax)[0]
+            if len(imax) == 0:
+                raise ValueError('bmax is too small (%s), it is smaller than the '
+                                 'smallest time value' % (bmax,))
+            imax = int(imax[-1]) + 1
+        if imin >= imax:
+            raise ValueError('Bad rescaling slice (%s:%s) from time values %s, %s'
+                             % (imin, imax, bmin, bmax))
+        use_array = data[..., imin:imax]
+
+    # avoid potential "empty slice" warning
+    if data.shape[-1] > 0:
+        mean = np.mean(use_array, axis=-1)[..., None]
+    else:
+        mean = 0  # otherwise we get an ugly nan
+    if mode == 'mean':
+        data -= mean
+    if mode == 'logratio':
+        data /= mean
+        data = np.log10(data)  # a value of 1 means 10 times bigger
+    if mode == 'ratio':
+        data /= mean
+    elif mode == 'zscore':
+        std = np.std(use_array, axis=-1)[..., None]
+        data -= mean
+        data /= std
+    elif mode == 'percent':
+        data -= mean
+        data /= mean
+    elif mode == 'zlogratio':
+        data /= mean
+        data = np.log10(data)
+        std = np.std(use_array, axis=-1)[..., None]
+        data /= std
+
+    return data
